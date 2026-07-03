@@ -294,7 +294,10 @@ async def get_models(request: Request):
     
     # 2. Try to fetch dynamically from Quarterly
     target_url = f"https://{TARGET_HOST}/v1/models"
-    headers = {"authorization": f"Bearer {key_mapping['quarterly_key']}"}
+    headers = {
+        "authorization": f"Bearer {key_mapping['quarterly_key']}",
+        "x-api-key": key_mapping['quarterly_key']
+    }
     
     try:
         response = await http_client.get(target_url, headers=headers)
@@ -384,8 +387,9 @@ async def proxy_request(request: Request, path: str):
             continue
         headers[k] = v
 
-    # 4. Inject translated real Quarterly API Key
+    # 4. Inject translated real Quarterly API Key in both formats (OpenAI & Anthropic)
     headers["authorization"] = f"Bearer {key_mapping['quarterly_key']}"
+    headers["x-api-key"] = key_mapping['quarterly_key']
 
     # Read body
     body = await request.body()
