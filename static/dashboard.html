@@ -591,37 +591,22 @@
 
         <!-- Panels -->
         <div class="workspace-grid">
-            <!-- Column 1: Forms & Helpers -->
-            <div style="display: flex; flex-direction: column; gap: 1.5rem; width: 100%;">
-                <!-- Create Key -->
-                <div class="panel" style="width: 100%;">
-                    <div class="panel-header">
-                        <h2 class="panel-title">Generate New Key</h2>
-                    </div>
-                    <form id="keyForm" onsubmit="createKey(event)">
-                        <div class="form-group">
-                            <label class="form-label" for="label">Key Description / Label</label>
-                            <input class="form-input" type="text" id="label" placeholder="e.g. EasySubs Main Site" required>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label" for="quarterly_key">Real Quarterly API Key</label>
-                            <input class="form-input" type="password" id="quarterly_key" placeholder="qua-..." required>
-                        </div>
-                        <button class="submit-btn" type="submit" id="genBtn">Generate Proxy Key</button>
-                    </form>
+            <!-- Create Key -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">Generate New Key</h2>
                 </div>
-
-                <!-- Railway Persistence Helper -->
-                <div class="panel" style="width: 100%;">
-                    <div class="panel-header">
-                        <h2 class="panel-title">Railway Backup Helper</h2>
+                <form id="keyForm" onsubmit="createKey(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="label">Key Description / Label</label>
+                        <input class="form-input" type="text" id="label" placeholder="e.g. EasySubs Main Site" required>
                     </div>
-                    <p style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.8rem; line-height: 1.4;">
-                        Since your Railway account has no persistent volume, save the JSON block below as a <strong><code>PROXY_KEYS</code></strong> variable in your Railway service settings. This restores your keys automatically when you redeploy.
-                    </p>
-                    <div style="background: rgba(9, 13, 22, 0.65); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px; padding: 10px; font-family: monospace; font-size: 0.72rem; color: #cbd5e1; word-break: break-all; max-height: 120px; overflow-y: auto; margin-bottom: 0.8rem;" id="envVarCode">[]</div>
-                    <button class="submit-btn" style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.3); color: #c084fc; margin-top: 0; padding: 10px;" onclick="copyEnvVar()">Copy PROXY_KEYS JSON</button>
-                </div>
+                    <div class="form-group">
+                        <label class="form-label" for="quarterly_key">Real Quarterly API Key</label>
+                        <input class="form-input" type="password" id="quarterly_key" placeholder="qua-..." required>
+                    </div>
+                    <button class="submit-btn" type="submit" id="genBtn">Generate Proxy Key</button>
+                </form>
             </div>
 
             <!-- List Keys -->
@@ -740,14 +725,6 @@
             document.getElementById('metricActiveKeys').textContent = activeKeys;
             document.getElementById('metricRequests').textContent = totalRequests;
 
-            // Generate PROXY_KEYS JSON for manual env backup
-            const syncArray = cachedKeys.map(k => ({
-                label: k.label,
-                proxy_key: k.proxy_key,
-                quarterly_key: k.quarterly_key,
-                status: k.status
-            }));
-            document.getElementById('envVarCode').textContent = JSON.stringify(syncArray);
 
             if (totalKeys === 0) {
                 emptyState.style.display = 'block';
@@ -943,12 +920,6 @@
             });
         }
 
-        function copyEnvVar() {
-            const envVal = document.getElementById('envVarCode').textContent;
-            navigator.clipboard.writeText(envVal).then(() => {
-                showToast('PROXY_KEYS JSON copied to clipboard!');
-            });
-        }
 
         // Helper escape HTML
         function escapeHtml(text) {

@@ -59,8 +59,6 @@ def init_db():
         """)
         conn.commit()
         logger.info("Database initialized successfully.")
-        # Load any keys from environment variables
-        load_env_keys()
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
         conn.rollback()
@@ -225,48 +223,4 @@ def delete_session(session_id: str) -> bool:
     finally:
         conn.close()
 
-def load_env_keys():
-    """Loads API keys from the PROXY_KEYS environment variable if defined."""
-    env_keys_str = os.environ.get("PROXY_KEYS")
-    if not env_keys_str:
-        return
-    
-    import json
-    try:
-        keys_list = json.loads(env_keys_str)
-        if not isinstance(keys_list, list):
-            logger.error("PROXY_KEYS environment variable must be a JSON array")
-            return
-            
-        conn = get_connection()
-        try:
-            cursor = conn.cursor()
-            for item in keys_list:
-                if not isinstance(item, dict):
-                    continue
-                label = item.get("label", "Imported Key").strip()
-                proxy_key = item.get("proxy_key", "").strip()
-                quarterly_key = item.get("quarterly_key", "").strip()
-                status = item.get("status", "active").strip()
-                
-                if proxy_key and quarterly_key:
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO api_keys (label, proxy_key, quarterly_key, status, request_count, created_at)
-                        VALUES (
-                            ?, 
-                            ?, 
-                            ?, 
-                            ?, 
-                            COALESCE((SELECT request_count FROM api_keys WHERE proxy_key = ?), 0),
-                            COALESCE((SELECT created_at FROM api_keys WHERE proxy_key = ?), CURRENT_TIMESTAMP)
-                        )
-                    """, (label, proxy_key, quarterly_key, status, proxy_key, proxy_key))
-            conn.commit()
-            logger.warning("Successfully seeded database with keys from PROXY_KEYS env var.")
-        except Exception as db_err:
-            logger.error(f"Database error seeding PROXY_KEYS: {db_err}")
-            conn.rollback()
-        finally:
-            conn.close()
-    except Exception as parse_err:
-        logger.error(f"JSON parsing error for PROXY_KEYS: {parse_err}")
+
