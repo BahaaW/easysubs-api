@@ -56,8 +56,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize a global async HTTP client with a 3-minute timeout for high concurrency connection pooling
-http_client = httpx.AsyncClient(timeout=180.0)
+# Initialize a global async HTTP client with a 3-minute timeout and HTTP/2 multiplexing support
+http_client = httpx.AsyncClient(timeout=180.0, http2=True)
 
 @app.on_event("shutdown")
 async def shutdown_event():
