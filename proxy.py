@@ -225,6 +225,52 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
                             tool_call["index"] = mapped_idx
     return chunk
 
+# Models endpoints (OpenAI-compatible)
+@app.get("/v1/models")
+@app.get("/models")
+async def get_models(request: Request):
+    # 1. Authenticate proxy key
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token in Authorization header.")
+    
+    proxy_key = auth_header[7:].strip()
+    key_mapping = db.get_key_by_proxy_key(proxy_key)
+    if not key_mapping:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid, inactive, or revoked API key.")
+        
+    db.increment_request_count(proxy_key)
+    
+    # 2. Try to fetch dynamically from Quarterly
+    target_url = f"https://{TARGET_HOST}/v1/models"
+    headers = {"authorization": f"Bearer {key_mapping['quarterly_key']}"}
+    
+    try:
+        response = await http_client.get(target_url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch models from Quarterly: {e}. Falling back to static list.")
+        
+    # 3. Fallback static list of models from IMPPP.txt (OpenAI-compatible)
+    fallback_models = [
+        {"id": "claude-haiku-4-5-20251001", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-6", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-6-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-7", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-7-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-8", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-opus-4-8-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-sonnet-4-6", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-sonnet-4-6-20250929", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "claude-sonnet-4-6-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+        {"id": "gemini-3.1-pro", "object": "model", "created": 1700000000, "owned_by": "google"},
+        {"id": "gemini-3.1-pro-low", "object": "model", "created": 1700000000, "owned_by": "google"},
+        {"id": "gpt-5.4", "object": "model", "created": 1700000000, "owned_by": "openai"},
+        {"id": "gpt-5.5", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    ]
+    return {"object": "list", "data": fallback_models}
+
 # Catch-all Route: translates proxy API keys to real Quarterly keys and forwards the requests
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy_request(request: Request, path: str):
