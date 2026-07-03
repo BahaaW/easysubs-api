@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EasySubs API Console</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;550;650;750&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-gradient: linear-gradient(135deg, #090d16 0%, #111322 50%, #1c0b24 100%);
+            --glass-bg: rgba(17, 20, 36, 0.45);
+            --glass-border: rgba(255, 255, 255, 0.06);
+            --glass-card: rgba(255, 255, 255, 0.03);
+            --accent-primary: linear-gradient(90deg, #6366f1 0%, #a855f7 100%);
+            --accent-glow: rgba(168, 85, 247, 0.3);
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --success-color: #10b981;
+            --danger-color: #f43f5e;
+            --warning-color: #f59e0b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+        }
+
+        body {
+            background: var(--bg-gradient);
+            background-attachment: fixed;
+            min-height: 100vh;
+            color: var(--text-primary);
+            overflow-x: hidden;
+            position: relative;
+            padding-bottom: 50px;
+        }
+
+        /* Abstract glowing spheres in background for depth */
+        .glow-sphere {
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(140px);
+            z-index: 0;
+            opacity: 0.12;
+            pointer-events: none;
+        }
+
+        .sphere-1 {
+            width: 500px;
+            height: 500px;
+            background: #6366f1;
+            top: -100px;
+            right: -100px;
+        }
+
+        .sphere-2 {
+            width: 450px;
+            height: 450px;
+            background: #a855f7;
+            bottom: 10%;
+            left: -150px;
+        }
+
+        .navbar {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(9, 13, 22, 0.6);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--glass-border);
+            padding: 1.2rem 4%;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-mark {
+            width: 40px;
+            height: 40px;
+            background: var(--accent-primary);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            font-weight: 800;
+            color: #ffffff;
+            box-shadow: 0 4px 15px var(--accent-glow);
+            font-family: 'Outfit', sans-serif;
+        }
+
+        .brand-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.35rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #ffffff 0%, #e2e8f0 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logout-btn {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 8px 18px;
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .logout-btn:hover {
+            background: rgba(244, 63, 94, 0.1);
+            border-color: var(--danger-color);
+            color: #ff4a6b;
+        }
+
+        .main-content {
+            position: relative;
+            z-index: 1;
+            max-width: 1280px;
+            margin: 2.5rem auto 0 auto;
+            padding: 0 4%;
+        }
+
+        /* Metrics grid */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .metric-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            padding: 1.8rem;
+            border-radius: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .metric-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .metric-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .metric-footer {
+            font-size: 0.8rem;
+            color: var(--success-color);
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        /* Workspace Grid */
+        .workspace-grid {
+            display: grid;
+            grid-template-columns: 1.1fr 2fr;
+            gap: 2rem;
+            align-items: start;
+        }
+
+        @media (max-width: 1024px) {
+            .workspace-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.4);
+        }
+
+        .panel-header {
+            margin-bottom: 1.8rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .panel-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        /* Form elements */
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 14px;
+            background: rgba(9, 13, 22, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        .form-input:focus {
+            border-color: #a855f7;
+            box-shadow: 0 0 10px rgba(168, 85, 247, 0.15);
+            background: rgba(9, 13, 22, 0.7);
+        }
+
+        .submit-btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--accent-primary);
+            border: none;
+            border-radius: 10px;
+            color: #ffffff;
+            font-size: 0.95rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px var(--accent-glow);
+            margin-top: 0.5rem;
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.1);
+            box-shadow: 0 8px 20px var(--accent-glow);
+        }
+
+        /* Table */
+        .table-container {
+            overflow-x: auto;
+            margin-top: 1rem;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .keys-table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
+        .keys-table th {
+            background: rgba(255, 255, 255, 0.02);
+            color: var(--text-secondary);
+            padding: 14px 18px;
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .keys-table td {
+            padding: 16px 18px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            color: var(--text-primary);
+        }
+
+        .keys-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .keys-table tr:hover td {
+            background: rgba(255, 255, 255, 0.01);
+        }
+
+        .key-badge {
+            display: inline-flex;
+            align-items: center;
+            font-family: monospace;
+            background: rgba(255, 255, 255, 0.06);
+            padding: 4px 8px;
+            border-radius: 6px;
+            gap: 8px;
+            color: var(--text-primary);
+        }
+
+        .copy-icon {
+            cursor: pointer;
+            color: var(--text-secondary);
+            transition: color 0.2s ease;
+        }
+
+        .copy-icon:hover {
+            color: #ffffff;
+        }
+
+        /* Toggle switch */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(255, 255, 255, 0.1);
+            transition: .3s;
+            border-radius: 24px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(20px);
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .status-pill.active {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success-color);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+
+        .status-pill.disabled {
+            background: rgba(244, 63, 94, 0.1);
+            color: var(--danger-color);
+            border: 1px solid rgba(244, 63, 94, 0.2);
+        }
+
+        .delete-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 6px;
+            border-radius: 6px;
+            transition: all 0.2s ease;
+        }
+
+        .delete-btn:hover {
+            color: var(--danger-color);
+            background: rgba(244, 63, 94, 0.08);
+        }
+
+        /* Modal for new keys */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(8px);
+            z-index: 200;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal {
+            background: rgba(15, 20, 35, 0.95);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 2.5rem;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+            animation: modalScale 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+
+        @keyframes modalScale {
+            from { transform: scale(0.9); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+
+        .modal-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 0.8rem;
+            color: var(--text-primary);
+        }
+
+        .modal-desc {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+            line-height: 1.5;
+        }
+
+        .generated-key-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(9, 13, 22, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 14px 16px;
+            font-family: monospace;
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            margin-bottom: 2rem;
+            word-break: break-all;
+            gap: 10px;
+        }
+
+        .modal-close-btn {
+            width: 100%;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .modal-close-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        /* Toast widget */
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(10px);
+            padding: 12px 24px;
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            font-weight: 600;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .toast.success {
+            border-left: 4px solid var(--success-color);
+        }
+
+        .toast.error {
+            border-left: 4px solid var(--danger-color);
+        }
+
+        /* Helper styles */
+        .empty-state {
+            text-align: center;
+            padding: 3rem 0;
+            color: var(--text-secondary);
+        }
+
+        .empty-state svg {
+            margin-bottom: 1rem;
+            opacity: 0.3;
+        }
+    </style>
+</head>
+<body>
+    <div class="glow-sphere sphere-1"></div>
+    <div class="glow-sphere sphere-2"></div>
+
+    <nav class="navbar">
+        <div class="brand">
+            <div class="logo-mark">ES</div>
+            <span class="brand-title">EasySubs API Console</span>
+        </div>
+        <button class="logout-btn" onclick="handleLogout()">Log Out</button>
+    </nav>
+
+    <main class="main-content">
+        <!-- Metrics -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <span class="metric-label">Proxy Requests</span>
+                <span class="metric-value" id="metricRequests">0</span>
+                <span class="metric-footer">
+                    <svg width="12" height="12" fill="currentColor" viewBox="0 0 16 16">
+                        <path fill-rule="evenodd" d="M8 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L7.5 2.707V14.5a.5.5 0 0 0 .5.5z"/>
+                    </svg>
+                    Live translation logging
+                </span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-label">Active Proxy Keys</span>
+                <span class="metric-value" id="metricActiveKeys">0</span>
+                <span class="metric-footer" style="color: var(--success-color);">
+                    Healthy routing status
+                </span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-label">Total Allocated Keys</span>
+                <span class="metric-value" id="metricTotalKeys">0</span>
+                <span class="metric-footer" style="color: var(--text-secondary);">
+                    Database registered keys
+                </span>
+            </div>
+        </div>
+
+        <!-- Panels -->
+        <div class="workspace-grid">
+            <!-- Create Key -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">Generate New Key</h2>
+                </div>
+                <form id="keyForm" onsubmit="createKey(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="label">Key Description / Label</label>
+                        <input class="form-input" type="text" id="label" placeholder="e.g. EasySubs Main Site" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="quarterly_key">Real Quarterly API Key</label>
+                        <input class="form-input" type="password" id="quarterly_key" placeholder="qua-..." required>
+                    </div>
+                    <button class="submit-btn" type="submit" id="genBtn">Generate Proxy Key</button>
+                </form>
+            </div>
+
+            <!-- List Keys -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2 class="panel-title">Allocated API Keys</h2>
+                </div>
+                <div class="table-container">
+                    <table class="keys-table">
+                        <thead>
+                            <tr>
+                                <th>Description</th>
+                                <th>Proxy API Key</th>
+                                <th>Quarterly Key</th>
+                                <th>Calls</th>
+                                <th>State</th>
+                                <th>Created</th>
+                                <th>Delete</th>
+                            </tr>
+                        </thead>
+                        <tbody id="keysTableBody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+                <div id="emptyState" class="empty-state" style="display: none;">
+                    <svg width="40" height="40" fill="currentColor" viewBox="0 0 16 16">
+                        <path d="M3.5 11.5a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 0 1H4a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 0 1H4a.5.5 0 0 1-.5-.5zm0-4a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 0 1H4a.5.5 0 0 1-.5-.5z"/>
+                    </svg>
+                    <p>No proxy API keys found in the database. Generate one to get started.</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Key reveal modal -->
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal">
+            <h3 class="modal-title">Proxy API Key Generated</h3>
+            <p class="modal-desc">
+                Copy this newly generated API key. For security, it will not be displayed fully again in the console. 
+                Configure it on your client website on Railway.
+            </p>
+            <div class="generated-key-container">
+                <span id="revealedKey">esk-placeholder</span>
+                <span class="copy-icon" onclick="copyRevealedKey()" title="Copy Key">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+                        <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/>
+                        <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
+                    </svg>
+                </span>
+            </div>
+            <button class="modal-close-btn" onclick="closeModal()">Close</button>
+        </div>
+    </div>
+
+    <!-- Toast widgets -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        let cachedKeys = [];
+
+        // Toast notifications helper
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.innerHTML = `
+                <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16">
+                    <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
+                </svg>
+                <span>${message}</span>
+            `;
+            container.appendChild(toast);
+            
+            // Trigger animation
+            setTimeout(() => toast.classList.add('show'), 50);
+            
+            // Remove toast
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        // Fetch keys from API and update UI
+        async function fetchKeys() {
+            try {
+                const response = await fetch('/api/admin/keys');
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                const data = await response.json();
+                cachedKeys = data;
+                renderDashboard();
+            } catch (err) {
+                console.error('Error fetching keys:', err);
+                showToast('Failed to fetch keys from server.', 'error');
+            }
+        }
+
+        // Render dashboard values
+        function renderDashboard() {
+            const tableBody = document.getElementById('keysTableBody');
+            const emptyState = document.getElementById('emptyState');
+            
+            tableBody.innerHTML = '';
+
+            // Update stats
+            const totalKeys = cachedKeys.length;
+            const activeKeys = cachedKeys.filter(k => k.status === 'active').length;
+            const totalRequests = cachedKeys.reduce((acc, key) => acc + (key.request_count || 0), 0);
+
+            document.getElementById('metricTotalKeys').textContent = totalKeys;
+            document.getElementById('metricActiveKeys').textContent = activeKeys;
+            document.getElementById('metricRequests').textContent = totalRequests;
+
+            if (totalKeys === 0) {
+                emptyState.style.display = 'block';
+                return;
+            } else {
+                emptyState.style.display = 'none';
+            }
+
+            cachedKeys.forEach(key => {
+                const tr = document.createElement('tr');
+                
+                // Mask keys for presentation
+                const maskedProxy = key.proxy_key.slice(0, 7) + '...' + key.proxy_key.slice(-4);
+                const maskedQuat = key.quarterly_key.slice(0, 7) + '...' + key.quarterly_key.slice(-4);
+                
+                // Format date
+                const date = new Date(key.created_at + 'Z'); // SQLite timestamp in UTC
+                const formattedDate = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+                tr.innerHTML = `
+                    <td style="font-weight: 600;">${escapeHtml(key.label)}</td>
+                    <td>
+                        <div class="key-badge">
+                            <span>${maskedProxy}</span>
+                            <span class="copy-icon" onclick="copyToClipboard('${key.proxy_key}', 'Proxy Key')" title="Copy Proxy Key">
+                                <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/>
+                                    <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
+                                </svg>
+                            </span>
+                        </div>
+                    </td>
+                    <td>
+                        <div class="key-badge" style="background: rgba(255,255,255,0.03); opacity: 0.75;">
+                            <span>${maskedQuat}</span>
+                        </div>
+                    </td>
+                    <td style="font-family: monospace; font-weight: bold;">${key.request_count}</td>
+                    <td>
+                        <label class="switch">
+                            <input type="checkbox" ${key.status === 'active' ? 'checked' : ''} onchange="toggleKey(${key.id})">
+                            <span class="slider"></span>
+                        </label>
+                    </td>
+                    <td style="font-size: 0.8rem; color: var(--text-secondary);">${formattedDate}</td>
+                    <td>
+                        <button class="delete-btn" onclick="deleteKey(${key.id}, '${escapeHtml(key.label)}')" title="Delete Key">
+                            <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                            </svg>
+                        </button>
+                    </td>
+                `;
+                tableBody.appendChild(tr);
+            });
+        }
+
+        // Form submit to create a key
+        async function createKey(event) {
+            event.preventDefault();
+            const labelInput = document.getElementById('label');
+            const quarterlyInput = document.getElementById('quarterly_key');
+            const genBtn = document.getElementById('genBtn');
+
+            genBtn.textContent = 'Generating...';
+            genBtn.disabled = true;
+
+            try {
+                const response = await fetch('/api/admin/keys', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        label: labelInput.value,
+                        quarterly_key: quarterlyInput.value
+                    })
+                });
+
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                const data = await response.json();
+                
+                if (response.ok && data.proxy_key) {
+                    showToast('Key generated successfully!');
+                    
+                    // Reset fields
+                    labelInput.value = '';
+                    quarterlyInput.value = '';
+                    
+                    // Show reveal modal
+                    document.getElementById('revealedKey').textContent = data.proxy_key;
+                    document.getElementById('modalOverlay').style.display = 'flex';
+
+                    // Re-fetch list
+                    await fetchKeys();
+                } else {
+                    showToast(data.detail || 'Failed to create key.', 'error');
+                }
+            } catch (err) {
+                console.error(err);
+                showToast('Network error while generating key.', 'error');
+            } finally {
+                genBtn.textContent = 'Generate Proxy Key';
+                genBtn.disabled = false;
+            }
+        }
+
+        // Toggle state active/disabled
+        async function toggleKey(id) {
+            try {
+                const response = await fetch(`/api/admin/keys/${id}/toggle`, {
+                    method: 'POST'
+                });
+                
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                if (response.ok) {
+                    const data = await response.json();
+                    showToast(`Key is now ${data.status}.`);
+                    await fetchKeys();
+                } else {
+                    showToast('Failed to toggle status.', 'error');
+                    await fetchKeys(); // revert checkbox
+                }
+            } catch (err) {
+                console.error(err);
+                showToast('Network error.', 'error');
+                await fetchKeys();
+            }
+        }
+
+        // Delete key
+        async function deleteKey(id, label) {
+            if (!confirm(`Are you sure you want to permanently delete "${label}"? This will break any integrations using its proxy key.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/admin/keys/${id}`, {
+                    method: 'DELETE'
+                });
+
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                if (response.ok) {
+                    showToast(`API Key "${label}" removed successfully.`);
+                    await fetchKeys();
+                } else {
+                    showToast('Failed to delete API key.', 'error');
+                }
+            } catch (err) {
+                console.error(err);
+                showToast('Network error.', 'error');
+            }
+        }
+
+        // Logout
+        async function handleLogout() {
+            try {
+                await fetch('/api/admin/logout', { method: 'POST' });
+                window.location.href = '/login';
+            } catch (err) {
+                window.location.href = '/login';
+            }
+        }
+
+        // Modal triggers
+        function closeModal() {
+            document.getElementById('modalOverlay').style.display = 'none';
+        }
+
+        function copyRevealedKey() {
+            const keyText = document.getElementById('revealedKey').textContent;
+            navigator.clipboard.writeText(keyText).then(() => {
+                showToast('New Proxy Key copied to clipboard!');
+            });
+        }
+
+        function copyToClipboard(text, name) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(`${name} copied to clipboard!`);
+            });
+        }
+
+        // Helper escape HTML
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Initial load
+        window.addEventListener('DOMContentLoaded', fetchKeys);
+    </script>
+</body>
+</html>
