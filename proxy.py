@@ -267,12 +267,25 @@ async def get_models(request: Request):
     if is_rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
         
-    # 1. Authenticate proxy key
+    # 1. Authenticate proxy key via Bearer token or x-api-key
+    proxy_key = None
     auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token in Authorization header.")
+    if auth_header and auth_header.startswith("Bearer "):
+        proxy_key = auth_header[7:].strip()
+    else:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            proxy_key = x_api_key.strip()
+        else:
+            # Case insensitive check
+            for k, v in request.headers.items():
+                if k.lower() == "x-api-key":
+                    proxy_key = v.strip()
+                    break
+                    
+    if not proxy_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
     
-    proxy_key = auth_header[7:].strip()
     key_mapping = db.get_key_by_proxy_key(proxy_key)
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid, inactive, or revoked API key.")
@@ -316,12 +329,24 @@ async def proxy_request(request: Request, path: str):
     if is_rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
         
-    # 1. Authenticate proxy key from Authorization header
+    # 1. Authenticate proxy key via Bearer token or x-api-key
+    proxy_key = None
     auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token in Authorization header.")
-    
-    proxy_key = auth_header[7:].strip()
+    if auth_header and auth_header.startswith("Bearer "):
+        proxy_key = auth_header[7:].strip()
+    else:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            proxy_key = x_api_key.strip()
+        else:
+            # Case insensitive check
+            for k, v in request.headers.items():
+                if k.lower() == "x-api-key":
+                    proxy_key = v.strip()
+                    break
+                    
+    if not proxy_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
     
     # 2. Lookup Quarterly key mapping
     key_mapping = db.get_key_by_proxy_key(proxy_key)
@@ -338,7 +363,7 @@ async def proxy_request(request: Request, path: str):
     headers = {}
     for k, v in request.headers.items():
         k_lower = k.lower()
-        # HTTP/2 pseudo-headers (starting with ':') and hop-by-hop headers must not be forwarded
+        # HTTP/2 pseudo-headers (starting with ':'), auth keys, and hop-by-hop headers must not be forwarded
         if k_lower.startswith(":") or k_lower in [
             "host",
             "connection",
@@ -352,7 +377,9 @@ async def proxy_request(request: Request, path: str):
             "te",
             "trailers",
             "upgrade",
-            "proxy-connection"
+            "proxy-connection",
+            "x-api-key",       # Filter out client's x-api-key
+            "authorization"    # Filter out client's bearer token
         ]:
             continue
         headers[k] = v
