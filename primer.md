@@ -5,7 +5,9 @@
 - Created glassmorphic admin pages (`login.html` and `dashboard.html`) in `static/`.
 - Updated `proxy.py` with session cookies, silent warning/error logging, and translated proxy bearer keys.
 - Shared global `httpx.AsyncClient` with a 3-minute timeout to handle concurrent API requests.
+- Implemented OpenAI-compatible `/v1/models` and `/models` endpoints dynamically forwarding to Quarterly with static fallback.
+- Integrated sliding window IP-based rate limiting on admin login, models, and proxy routes.
 - Added `Procfile` and `.gitignore` for Railway deployment.
-- Wrote integration tests verifying 100% database, auth, and concurrent proxy translation success.
+- Wrote integration tests verifying 100% database, auth, rate limiting, and concurrent proxy translation success.
 **Next step**: Deploy the project on Railway, configure admin credentials env vars, and attach a `/data` volume.
 **Blockers**: None.
