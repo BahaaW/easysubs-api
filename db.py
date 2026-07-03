@@ -6,10 +6,19 @@ import logging
 
 logger = logging.getLogger("QuartarlyProxy.DB")
 
-# Determine DB location. If /data volume exists and is writable, use it. Otherwise use local fallback.
-if os.path.exists("/data") and os.access("/data", os.W_OK):
+# Determine DB location.
+# 1. Explicit environment variable check
+if os.environ.get("DATABASE_PATH"):
+    DB_PATH = os.environ.get("DATABASE_PATH")
+    parent_dir = os.path.dirname(DB_PATH)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    logger.info(f"Using database path from env: {DB_PATH}")
+# 2. If /data volume exists and is writable, use it.
+elif os.path.exists("/data") and os.access("/data", os.W_OK):
     DB_PATH = "/data/database.db"
     logger.info(f"Using Railway persistent volume database path: {DB_PATH}")
+# 3. Local fallback
 else:
     os.makedirs("data", exist_ok=True)
     DB_PATH = "data/database.db"
