@@ -7,6 +7,7 @@
 - Shared global `httpx.AsyncClient` with a 3-minute timeout to handle concurrent API requests.
 - Implemented OpenAI-compatible `/v1/models` and `/models` endpoints dynamically forwarding to Quarterly with static fallback.
 - Integrated sliding window IP-based rate limiting on admin login, models, and proxy routes.
+- Supported Anthropic-style `x-api-key` authentication headers for compatibility with Claude Code startup and prompt hooks.
 - Added `Procfile` and `.gitignore` for Railway deployment.
 - Wrote integration tests verifying 100% database, auth, rate limiting, and concurrent proxy translation success.
 **Next step**: Deploy client integrations utilizing the newly generated `esk-...` API keys.
