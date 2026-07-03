@@ -9,5 +9,5 @@
 - Integrated sliding window IP-based rate limiting on admin login, models, and proxy routes.
 - Added `Procfile` and `.gitignore` for Railway deployment.
 - Wrote integration tests verifying 100% database, auth, rate limiting, and concurrent proxy translation success.
-**Next step**: Deploy the project on Railway, configure admin credentials env vars, and attach a `/data` volume.
+**Next step**: Deploy client integrations utilizing the newly generated `esk-...` API keys.
 **Blockers**: None.
