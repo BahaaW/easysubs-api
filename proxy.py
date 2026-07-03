@@ -11,9 +11,39 @@ import uvicorn
 
 import db
 
+import time
+
 # Configure logging (only show warnings and errors)
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("QuartarlyProxy")
+
+# Rate limiting settings (default: 120 requests per 60 seconds per IP)
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 120))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", 60))
+ip_request_history = {}
+
+def get_client_ip(request: Request) -> str:
+    """Extracts the real client IP address, handling reverse proxies."""
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def is_rate_limited(ip: str) -> bool:
+    """Checks if the given IP address has exceeded the rate limit."""
+    now = time.time()
+    if ip not in ip_request_history:
+        ip_request_history[ip] = []
+    
+    # Filter out timestamps older than the sliding window
+    cutoff = now - RATE_LIMIT_WINDOW
+    ip_request_history[ip] = [t for t in ip_request_history[ip] if t > cutoff]
+    
+    if len(ip_request_history[ip]) >= RATE_LIMIT_REQUESTS:
+        return True
+        
+    ip_request_history[ip].append(now)
+    return False
 
 app = FastAPI(title="EasySubs API Translation Proxy")
 
@@ -93,6 +123,10 @@ async def get_dashboard_page(request: Request):
 
 @app.post("/api/admin/login")
 async def admin_login(payload: LoginRequest, request: Request, response: Response):
+    client_ip = get_client_ip(request)
+    if is_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Please try again later.")
+        
     expected_user = os.environ.get("ADMIN_USERNAME", "admin")
     expected_pass = os.environ.get("ADMIN_PASSWORD", "admin_secure_pass")
     
@@ -229,6 +263,10 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
 @app.get("/v1/models")
 @app.get("/models")
 async def get_models(request: Request):
+    client_ip = get_client_ip(request)
+    if is_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
+        
     # 1. Authenticate proxy key
     auth_header = request.headers.get("authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -274,6 +312,10 @@ async def get_models(request: Request):
 # Catch-all Route: translates proxy API keys to real Quarterly keys and forwards the requests
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy_request(request: Request, path: str):
+    client_ip = get_client_ip(request)
+    if is_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
+        
     # 1. Authenticate proxy key from Authorization header
     auth_header = request.headers.get("authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -292,11 +334,12 @@ async def proxy_request(request: Request, path: str):
     # Construct target URL
     target_url = f"https://{TARGET_HOST}/{path}"
     
-    # Forward headers safely (filter out hop-by-hop and auto-managed headers)
+    # Forward headers safely (filter out hop-by-hop, auto-managed, and HTTP/2 pseudo-headers)
     headers = {}
     for k, v in request.headers.items():
         k_lower = k.lower()
-        if k_lower in [
+        # HTTP/2 pseudo-headers (starting with ':') and hop-by-hop headers must not be forwarded
+        if k_lower.startswith(":") or k_lower in [
             "host",
             "connection",
             "content-length",
@@ -308,7 +351,8 @@ async def proxy_request(request: Request, path: str):
             "proxy-authorization",
             "te",
             "trailers",
-            "upgrade"
+            "upgrade",
+            "proxy-connection"
         ]:
             continue
         headers[k] = v
