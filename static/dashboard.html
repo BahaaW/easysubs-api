@@ -749,7 +749,7 @@
                     <td>
                         <div class="key-badge">
                             <span>${maskedProxy}</span>
-                            <span class="copy-icon" onclick="copyToClipboard('${key.proxy_key}', 'Proxy Key')" title="Copy Proxy Key">
+                            <span class="copy-icon" data-copy="${key.proxy_key}" data-name="Proxy Key" title="Copy Proxy Key">
                                 <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16">
                                     <path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/>
                                     <path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/>
@@ -765,13 +765,13 @@
                     <td style="font-family: monospace; font-weight: bold;">${key.request_count}</td>
                     <td>
                         <label class="switch">
-                            <input type="checkbox" ${key.status === 'active' ? 'checked' : ''} onchange="toggleKey(${key.id})">
+                            <input type="checkbox" class="toggle-checkbox" data-id="${key.id}" ${key.status === 'active' ? 'checked' : ''}>
                             <span class="slider"></span>
                         </label>
                     </td>
                     <td style="font-size: 0.8rem; color: var(--text-secondary);">${formattedDate}</td>
                     <td>
-                        <button class="delete-btn" onclick="deleteKey(${key.id}, '${escapeHtml(key.label)}')" title="Delete Key">
+                        <button class="delete-btn" data-id="${key.id}" data-label="${escapeHtml(key.label)}" title="Delete Key">
                             <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
                                 <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
                                 <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
@@ -930,6 +930,25 @@
                 .replace(/"/g, "&quot;")
                 .replace(/'/g, "&#039;");
         }
+
+        // Event delegation for table actions — safer than inline onclick handlers
+        // because data-* attributes are read directly from the DOM, not injected into JS strings.
+        document.addEventListener('click', function(e) {
+            const deleteBtn = e.target.closest('.delete-btn');
+            if (deleteBtn) {
+                deleteKey(parseInt(deleteBtn.dataset.id), deleteBtn.dataset.label);
+                return;
+            }
+            const copyIcon = e.target.closest('.copy-icon[data-copy]');
+            if (copyIcon) {
+                copyToClipboard(copyIcon.dataset.copy, copyIcon.dataset.name);
+            }
+        });
+
+        document.addEventListener('change', function(e) {
+            const cb = e.target.closest('.toggle-checkbox');
+            if (cb) toggleKey(parseInt(cb.dataset.id));
+        });
 
         // Initial load
         window.addEventListener('DOMContentLoaded', fetchKeys);

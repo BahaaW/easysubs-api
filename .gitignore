@@ -10,3 +10,4 @@ data/
 venv/
 ENV/
 env/
+graphify-out/

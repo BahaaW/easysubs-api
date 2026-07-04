@@ -1,14 +1,9 @@
 # EasySubs API - Project Primer
-**Status**: Admin dashboard, translation proxy, 3-min timeouts, logging silence, and SQLite WAL concurrency complete.
+**Status**: Admin dashboard, translation proxy, 3-min timeouts, HTTP/2 support, logging silence, and SQLite WAL concurrency complete.
 **Completed this session**:
-- Created SQLite database layer (`db.py`) and enabled WAL mode with a 30s timeout.
-- Created glassmorphic admin pages (`login.html` and `dashboard.html`) in `static/`.
-- Updated `proxy.py` with session cookies, silent warning/error logging, and translated proxy bearer keys.
-- Shared global `httpx.AsyncClient` with a 3-minute timeout to handle concurrent API requests.
-- Implemented OpenAI-compatible `/v1/models` and `/models` endpoints dynamically forwarding to Quarterly with static fallback.
-- Integrated sliding window IP-based rate limiting on admin login, models, and proxy routes.
+- Enabled HTTP/2 multiplexing on global `httpx.AsyncClient` for high-concurrency request pipelining.
 - Supported Anthropic-style `x-api-key` authentication headers for compatibility with Claude Code startup and prompt hooks.
-- Added `Procfile` and `.gitignore` for Railway deployment.
-- Wrote integration tests verifying 100% database, auth, rate limiting, and concurrent proxy translation success.
-**Next step**: Deploy client integrations utilizing the newly generated `esk-...` API keys.
+- Integrated sliding window IP-based rate limiting on admin login, models, and proxy routes.
+- Wrote integration tests verifying 100% database, auth, rate limiting, and HTTP/2 proxy translation success.
+**Next step**: Run Claude Code queries and verify real-time performance metrics via the admin dashboard.
 **Blockers**: None.

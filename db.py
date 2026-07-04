@@ -11,6 +11,7 @@ logger = logging.getLogger("QuartarlyProxy.DB")
 # Only non-None results are cached; never caches invalid/unknown keys.
 # Entries are removed individually on toggle/delete, or wholesale on add.
 _keys_cache: dict = {}
+_MAX_CACHE_SIZE = 500  # cap prevents unbounded RAM growth if many keys are created
 
 # Determine DB location.
 # 1. Explicit environment variable check
@@ -41,7 +42,8 @@ def init_db():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # Enable Write-Ahead Logging (WAL) for high concurrency
+        # Enable Write-Ahead Logging (WAL) for high concurrency.
+        # WAL mode is persistent on the database file, so this is a no-op after the first run — still safe to call.
         cursor.execute("PRAGMA journal_mode=WAL;")
         
         # Create api_keys table
@@ -138,6 +140,9 @@ def get_key_by_proxy_key(proxy_key: str) -> dict:
         result = dict(row) if row else None
         # Only cache valid active keys — never cache None (invalid/unknown key)
         if result is not None:
+            if len(_keys_cache) >= _MAX_CACHE_SIZE:
+                # Evict the oldest entry (dict insertion order guaranteed Python 3.7+)
+                _keys_cache.pop(next(iter(_keys_cache)))
             _keys_cache[proxy_key] = result
         return result
     except Exception as e:
@@ -198,10 +203,12 @@ def delete_key(key_id: int) -> bool:
         cursor.execute("SELECT proxy_key FROM api_keys WHERE id = ?", (key_id,))
         row = cursor.fetchone()
         cursor.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+        # Capture rowcount BEFORE commit — some SQLite drivers reset it to -1 after commit
+        deleted = cursor.rowcount
         conn.commit()
         if row:
             _evict_key(row['proxy_key'])
-        return cursor.rowcount > 0
+        return deleted > 0
     except Exception as e:
         logger.error(f"Error deleting key {key_id}: {e}")
         conn.rollback()

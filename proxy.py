@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -22,6 +23,7 @@ logger = logging.getLogger("QuartarlyProxy")
 RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 120))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", 60))
 ip_request_history = {}
+_rate_limit_cleanup_counter = 0
 
 def get_client_ip(request: Request) -> str:
     """Extracts the real client IP address, handling reverse proxies."""
@@ -32,6 +34,7 @@ def get_client_ip(request: Request) -> str:
 
 def is_rate_limited(ip: str) -> bool:
     """Checks if the given IP address has exceeded the rate limit."""
+    global _rate_limit_cleanup_counter
     now = time.time()
     if ip not in ip_request_history:
         ip_request_history[ip] = []
@@ -44,9 +47,35 @@ def is_rate_limited(ip: str) -> bool:
         return True
         
     ip_request_history[ip].append(now)
+    
+    # Periodically sweep inactive IP entries to prevent unbounded dict growth.
+    # Every 1000 requests, remove IPs with no activity in the last window.
+    _rate_limit_cleanup_counter += 1
+    if _rate_limit_cleanup_counter >= 1000:
+        _rate_limit_cleanup_counter = 0
+        stale = [k for k, v in ip_request_history.items() if not v]
+        for k in stale:
+            del ip_request_history[k]
+    
     return False
 
-app = FastAPI(title="EasySubs API Translation Proxy")
+# Initialize a global async HTTP client with a 3-minute timeout and HTTP/2 multiplexing support
+http_client = httpx.AsyncClient(timeout=180.0, http2=True)
+
+# Use lifespan context manager (replaces deprecated @app.on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+    db.init_db()
+    admin_user = os.environ.get("ADMIN_USERNAME", "admin")
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "admin_secure_pass")
+    if admin_user == "admin" and admin_pass == "admin_secure_pass":
+        logger.warning("WARNING: Running with default admin credentials. Please set ADMIN_USERNAME and ADMIN_PASSWORD in environment variables.")
+    yield
+    # --- Shutdown ---
+    await http_client.aclose()
+
+app = FastAPI(title="EasySubs API Translation Proxy", lifespan=lifespan)
 
 # Add CORS Middleware
 app.add_middleware(
@@ -58,27 +87,11 @@ app.add_middleware(
 )
 
 # Compress responses larger than 1KB (JSON, HTML, etc.).
-# Starlette automatically skips SSE (text/event-stream) so streaming completions are unaffected.
+# accept-encoding is stripped from forwarded headers so upstream never sends pre-compressed
+# content — no risk of double-gzip. GZipMiddleware also skips SSE (text/event-stream).
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Initialize a global async HTTP client with a 3-minute timeout and HTTP/2 multiplexing support
-http_client = httpx.AsyncClient(timeout=180.0, http2=True)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await http_client.aclose()
-
 TARGET_HOST = "api.quatarly.cloud"
-
-# Initialize database on application startup
-@app.on_event("startup")
-def startup_event():
-    db.init_db()
-    # Log admin credentials warning if using defaults
-    admin_user = os.environ.get("ADMIN_USERNAME", "admin")
-    admin_pass = os.environ.get("ADMIN_PASSWORD", "admin_secure_pass")
-    if admin_user == "admin" and admin_pass == "admin_secure_pass":
-        logger.warning("WARNING: Running with default admin credentials. Please set ADMIN_USERNAME and ADMIN_PASSWORD in environment variables.")
 
 # Request models
 class LoginRequest(BaseModel):
@@ -273,6 +286,7 @@ async def get_models(request: Request):
         raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
         
     # 1. Authenticate proxy key via Bearer token or x-api-key
+    # Starlette normalizes all header names to lowercase, so .get() is already case-insensitive.
     proxy_key = None
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
@@ -281,15 +295,10 @@ async def get_models(request: Request):
         x_api_key = request.headers.get("x-api-key")
         if x_api_key:
             proxy_key = x_api_key.strip()
-        else:
-            # Case insensitive check
-            for k, v in request.headers.items():
-                if k.lower() == "x-api-key":
-                    proxy_key = v.strip()
-                    break
                     
     if not proxy_key:
         raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
+
     
     key_mapping = db.get_key_by_proxy_key(proxy_key)
     if not key_mapping:
@@ -338,6 +347,7 @@ async def proxy_request(request: Request, path: str):
         raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded.")
         
     # 1. Authenticate proxy key via Bearer token or x-api-key
+    # Starlette normalizes all header names to lowercase, so .get() is already case-insensitive.
     proxy_key = None
     auth_header = request.headers.get("authorization")
     if auth_header and auth_header.startswith("Bearer "):
@@ -346,12 +356,6 @@ async def proxy_request(request: Request, path: str):
         x_api_key = request.headers.get("x-api-key")
         if x_api_key:
             proxy_key = x_api_key.strip()
-        else:
-            # Case insensitive check
-            for k, v in request.headers.items():
-                if k.lower() == "x-api-key":
-                    proxy_key = v.strip()
-                    break
                     
     if not proxy_key:
         raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
@@ -405,26 +409,31 @@ async def proxy_request(request: Request, path: str):
     logger.info(f"Key '{key_mapping['label']}' forwarding {method} to: {target_url}")
     
     async def stream_generator(response: httpx.Response) -> Any:
+        """Yields SSE lines to the client and ensures the upstream response is always closed."""
         mapper = ToolCallIndexMapper()
-        async for line in response.aiter_lines():
-            if not line:
-                continue
-            
-            if line.startswith("data:"):
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    yield f"{line}\n\n".encode("utf-8")
+        try:
+            async for line in response.aiter_lines():
+                if not line:
                     continue
-                try:
-                    chunk = json.loads(data_str)
-                    sanitized = sanitize_json(chunk)
-                    sanitized = map_chunk_tool_calls(sanitized, mapper)
-                    yield f"data: {json.dumps(sanitized)}\n\n".encode("utf-8")
-                except Exception as e:
-                    logger.warning(f"Failed to parse chunk JSON: {data_str}. Error: {e}")
-                    yield f"{line}\n\n".encode("utf-8")
-            else:
-                yield f"{line}\n".encode("utf-8")
+                
+                if line.startswith("data:"):
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        yield f"{line}\n\n".encode("utf-8")
+                        continue
+                    try:
+                        chunk = json.loads(data_str)
+                        sanitized = sanitize_json(chunk)
+                        sanitized = map_chunk_tool_calls(sanitized, mapper)
+                        yield f"data: {json.dumps(sanitized)}\n\n".encode("utf-8")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse chunk JSON: {data_str}. Error: {e}")
+                        yield f"{line}\n\n".encode("utf-8")
+                else:
+                    yield f"{line}\n".encode("utf-8")
+        finally:
+            # Always close the upstream response — prevents HTTP/2 stream leaks on client disconnect
+            await response.aclose()
  
     try:
         # Build request to forward using the global connection pool
@@ -439,26 +448,33 @@ async def proxy_request(request: Request, path: str):
         
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" in content_type:
+            # stream_generator owns the response lifecycle and closes it in its finally block
             return StreamingResponse(
                 stream_generator(response),
                 status_code=response.status_code
             )
         else:
-            await response.aread()
             try:
-                # Attempt to parse as JSON and sanitize
-                response_json = response.json()
-                response_json = sanitize_json(response_json)
-                return JSONResponse(
-                    content=response_json,
-                    status_code=response.status_code
-                )
-            except Exception:
-                # If not JSON, return as raw content
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code
-                )
+                await response.aread()
+                try:
+                    # Attempt to parse as JSON and sanitize
+                    response_json = response.json()
+                    response_json = sanitize_json(response_json)
+                    return JSONResponse(
+                        content=response_json,
+                        status_code=response.status_code
+                    )
+                except Exception:
+                    # If not JSON, return as raw content
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code
+                    )
+            finally:
+                # Always close non-streaming responses to release the HTTP/2 stream
+                await response.aclose()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Proxy request failed with exception:")
         raise HTTPException(status_code=502, detail=f"Proxy Error: {type(e).__name__} - {str(e)}")
