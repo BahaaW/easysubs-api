@@ -15,6 +15,9 @@ import db
 
 import time
 
+# Global in-memory list to store the last 100 stream debug logs for troubleshooting
+debug_logs = []
+
 # Configure logging (only show warnings and errors)
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("QuartarlyProxy")
@@ -229,6 +232,11 @@ async def delete_key(key_id: int, request: Request):
         raise HTTPException(status_code=404, detail="API key not found")
     return {"success": True, "message": "API key deleted"}
 
+@app.get("/api/admin/debug_stream")
+async def get_debug_stream():
+    """Endpoint to fetch the last 100 stream chunk arrival timestamps."""
+    return {"logs": debug_logs}
+
 # ----------------- PROXY CORE LOGIC -----------------
 
 def sanitize_json(obj: Any) -> Any:
@@ -426,7 +434,12 @@ async def proxy_request(request: Request, path: str):
                     continue
                 
                 # Debug log chunk arrival times to isolate buffering
-                logger.warning(f"STREAM_DEBUG: Received line of length {len(line)} at {time.time()}")
+                log_msg = f"STREAM_DEBUG: Received line of length {len(line)} at {time.time()}"
+                logger.warning(log_msg)
+                global debug_logs
+                debug_logs.append(log_msg)
+                if len(debug_logs) > 100:
+                    debug_logs.pop(0)
                 
                 if line.startswith("data:"):
                     data_str = line[5:].strip()
