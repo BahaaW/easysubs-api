@@ -334,8 +334,6 @@ async def get_models(request: Request):
         {"id": "claude-sonnet-4-6-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
         {"id": "gemini-3.1-pro", "object": "model", "created": 1700000000, "owned_by": "google"},
         {"id": "gemini-3.1-pro-low", "object": "model", "created": 1700000000, "owned_by": "google"},
-        {"id": "gpt-5.4", "object": "model", "created": 1700000000, "owned_by": "openai"},
-        {"id": "gpt-5.5", "object": "model", "created": 1700000000, "owned_by": "openai"},
     ]
     return {"object": "list", "data": fallback_models}
 
