@@ -425,6 +425,9 @@ async def proxy_request(request: Request, path: str):
                 if not line:
                     continue
                 
+                # Debug log chunk arrival times to isolate buffering
+                logger.warning(f"STREAM_DEBUG: Received line of length {len(line)} at {time.time()}")
+                
                 if line.startswith("data:"):
                     data_str = line[5:].strip()
                     if data_str == "[DONE]":
