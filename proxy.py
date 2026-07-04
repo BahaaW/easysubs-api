@@ -317,25 +317,19 @@ async def get_models(request: Request):
         response = await http_client.get(target_url, headers=headers)
         if response.status_code == 200:
             return response.json()
+        else:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Quarterly Error: Failed to fetch models. Status: {response.status_code}"
+            )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Failed to fetch models from Quarterly: {e}. Falling back to static list.")
-        
-    # 3. Fallback static list of models from IMPPP.txt (OpenAI-compatible)
-    fallback_models = [
-        {"id": "claude-haiku-4-5-20251001", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-6", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-6-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-7", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-7-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-8", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-opus-4-8-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-sonnet-4-6", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-sonnet-4-6-20250929", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "claude-sonnet-4-6-thinking", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-        {"id": "gemini-3.1-pro", "object": "model", "created": 1700000000, "owned_by": "google"},
-        {"id": "gemini-3.1-pro-low", "object": "model", "created": 1700000000, "owned_by": "google"},
-    ]
-    return {"object": "list", "data": fallback_models}
+        logger.exception("Failed to fetch models from Quarterly:")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Bad Gateway: Failed to fetch models from Quarterly - {str(e)}"
+        )
 
 # Catch-all Route: translates proxy API keys to real Quarterly keys and forwards the requests
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
