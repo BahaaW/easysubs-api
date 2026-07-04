@@ -622,6 +622,7 @@
                                 <th>Proxy API Key</th>
                                 <th>Quarterly Key</th>
                                 <th>Calls</th>
+                                <th>Last Used</th>
                                 <th>State</th>
                                 <th>Created</th>
                                 <th>Delete</th>
@@ -743,6 +744,13 @@
                 // Format date
                 const date = new Date(key.created_at + 'Z'); // SQLite timestamp in UTC
                 const formattedDate = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                // Format last used date
+                let formattedLastUsed = 'Never';
+                if (key.last_used_at) {
+                    const lastUsedDate = new Date(key.last_used_at + 'Z');
+                    formattedLastUsed = lastUsedDate.toLocaleDateString() + ' ' + lastUsedDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
 
                 tr.innerHTML = `
                     <td style="font-weight: 600;">${escapeHtml(key.label)}</td>
@@ -763,6 +771,7 @@
                         </div>
                     </td>
                     <td style="font-family: monospace; font-weight: bold;">${key.request_count}</td>
+                    <td style="font-size: 0.8rem; color: var(--text-secondary); font-family: monospace;">${formattedLastUsed}</td>
                     <td>
                         <label class="switch">
                             <input type="checkbox" class="toggle-checkbox" data-id="${key.id}" ${key.status === 'active' ? 'checked' : ''}>

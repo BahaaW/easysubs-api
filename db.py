@@ -56,9 +56,18 @@ def init_db():
                 quarterly_key TEXT NOT NULL,
                 request_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP
             )
         """)
+        # Run column migration check if the database already exists
+        try:
+            cursor.execute("ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMP")
+        except sqlite3.OperationalError as e:
+            # OperationalError is raised if the column already exists
+            if "duplicate column name" not in str(e).lower():
+                raise e
+        
         # Create sessions table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -163,15 +172,21 @@ def get_key_by_proxy_key(proxy_key: str) -> dict:
         conn.close()
 
 def increment_request_count(proxy_key: str):
-    """Increments request counter for a proxy key."""
+    """Increments request counter and updates last used timestamp for a proxy key."""
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE api_keys SET request_count = request_count + 1 WHERE proxy_key = ?", (proxy_key,))
+        cursor.execute(
+            "UPDATE api_keys SET request_count = request_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE proxy_key = ?",
+            (proxy_key,)
+        )
         conn.commit()
         # Update cache in-place instead of evicting to keep the cache hot!
         if proxy_key in _keys_cache:
             _keys_cache[proxy_key]["data"]["request_count"] += 1
+            # Keep cached timestamp in sync with the database timestamp (UTC format string)
+            utc_now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            _keys_cache[proxy_key]["data"]["last_used_at"] = utc_now_str
             # Also slide the expiration forward on write hits
             _keys_cache[proxy_key]["expires_at"] = time.time() + _CACHE_TTL
     except Exception as e:
