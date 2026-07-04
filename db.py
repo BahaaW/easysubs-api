@@ -14,6 +14,9 @@ _keys_cache: dict = {}
 _MAX_CACHE_SIZE = 500
 _CACHE_TTL = 3600  # 1 hour sliding expiration
 
+# In-memory buffer to batch write request counts and timestamps
+_pending_increments: dict = {}
+
 # Determine DB location.
 # 1. Explicit environment variable check
 if os.environ.get("DATABASE_PATH"):
@@ -172,26 +175,47 @@ def get_key_by_proxy_key(proxy_key: str) -> dict:
         conn.close()
 
 def increment_request_count(proxy_key: str):
-    """Increments request counter and updates last used timestamp for a proxy key."""
+    """Accumulates request count and updates the last used timestamp in memory."""
+    global _pending_increments
+    
+    # 1. Update the write buffer
+    if proxy_key not in _pending_increments:
+        _pending_increments[proxy_key] = 0
+    _pending_increments[proxy_key] += 1
+    
+    # 2. Update the read cache immediately so the UI is accurate
+    if proxy_key in _keys_cache:
+        _keys_cache[proxy_key]["data"]["request_count"] += 1
+        utc_now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _keys_cache[proxy_key]["data"]["last_used_at"] = utc_now_str
+        _keys_cache[proxy_key]["expires_at"] = time.time() + _CACHE_TTL
+
+def flush_pending_increments():
+    """Flushes all pending in-memory increments to the SQLite database in a single transaction."""
+    global _pending_increments
+    if not _pending_increments:
+        return
+    
+    # Snapshot and clear to allow concurrent requests while we write to disk
+    to_flush = _pending_increments
+    _pending_increments = {}
+    
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE api_keys SET request_count = request_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE proxy_key = ?",
-            (proxy_key,)
-        )
+        # Batch execute to minimize transaction/disk overhead
+        for proxy_key, count in to_flush.items():
+            cursor.execute(
+                "UPDATE api_keys SET request_count = request_count + ?, last_used_at = CURRENT_TIMESTAMP WHERE proxy_key = ?",
+                (count, proxy_key)
+            )
         conn.commit()
-        # Update cache in-place instead of evicting to keep the cache hot!
-        if proxy_key in _keys_cache:
-            _keys_cache[proxy_key]["data"]["request_count"] += 1
-            # Keep cached timestamp in sync with the database timestamp (UTC format string)
-            utc_now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            _keys_cache[proxy_key]["data"]["last_used_at"] = utc_now_str
-            # Also slide the expiration forward on write hits
-            _keys_cache[proxy_key]["expires_at"] = time.time() + _CACHE_TTL
     except Exception as e:
-        logger.error(f"Error incrementing request count: {e}")
+        logger.error(f"Error flushing pending increments to database: {e}")
         conn.rollback()
+        # Restore pending increments on write failure
+        for k, v in to_flush.items():
+            _pending_increments[k] = _pending_increments.get(k, 0) + v
     finally:
         conn.close()
 

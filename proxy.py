@@ -13,6 +13,7 @@ import uvicorn
 
 import db
 
+import asyncio
 import time
 
 # Global in-memory list to store the last 100 stream debug logs for troubleshooting
@@ -62,8 +63,20 @@ def is_rate_limited(ip: str) -> bool:
     
     return False
 
-# Initialize a global async HTTP client with a 3-minute timeout and HTTP/2 multiplexing support
-http_client = httpx.AsyncClient(timeout=180.0, http2=True)
+# Increased keepalive pool limits for high concurrency
+limits = httpx.Limits(max_keepalive_connections=100, max_connections=500)
+http_client = httpx.AsyncClient(timeout=180.0, http2=True, limits=limits)
+
+async def flush_increments_periodically():
+    """Background task that flushes pending database metrics every 10 seconds."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            await asyncio.to_thread(db.flush_pending_increments)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in background metrics flusher: {e}")
 
 # Use lifespan context manager (replaces deprecated @app.on_event)
 @asynccontextmanager
@@ -74,8 +87,18 @@ async def lifespan(app: FastAPI):
     admin_pass = os.environ.get("ADMIN_PASSWORD", "admin_secure_pass")
     if admin_user == "admin" and admin_pass == "admin_secure_pass":
         logger.warning("WARNING: Running with default admin credentials. Please set ADMIN_USERNAME and ADMIN_PASSWORD in environment variables.")
+    
+    # Start background metrics flusher
+    flusher_task = asyncio.create_task(flush_increments_periodically())
     yield
     # --- Shutdown ---
+    flusher_task.cancel()
+    try:
+        await flusher_task
+    except asyncio.CancelledError:
+        pass
+    # Flush any remaining increments to disk before shutting down
+    db.flush_pending_increments()
     await http_client.aclose()
 
 app = FastAPI(title="EasySubs API Translation Proxy", lifespan=lifespan)
@@ -116,22 +139,22 @@ class KeyCreateRequest(BaseModel):
     label: str
     quarterly_key: str
 
-# Helper to verify admin session
-def is_authenticated(request: Request) -> bool:
+# Helper to verify admin session (async to avoid thread blocks)
+async def is_authenticated(request: Request) -> bool:
     session_id = request.cookies.get("admin_session")
-    return db.validate_session(session_id)
+    return await asyncio.to_thread(db.validate_session, session_id)
 
 # ----------------- ADMIN UI ROUTERS -----------------
 
 @app.get("/", response_class=HTMLResponse)
 async def root_redirect(request: Request):
-    if is_authenticated(request):
+    if await is_authenticated(request):
         return RedirectResponse(url="/dashboard")
     return RedirectResponse(url="/login")
 
 @app.get("/login", response_class=HTMLResponse)
 async def get_login_page(request: Request):
-    if is_authenticated(request):
+    if await is_authenticated(request):
         return RedirectResponse(url="/dashboard")
     
     file_path = os.path.join(os.path.dirname(__file__), "static", "login.html")
@@ -142,7 +165,7 @@ async def get_login_page(request: Request):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard_page(request: Request):
-    if not is_authenticated(request):
+    if not await is_authenticated(request):
         return RedirectResponse(url="/login")
     
     file_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
@@ -163,7 +186,7 @@ async def admin_login(payload: LoginRequest, request: Request, response: Respons
     expected_pass = os.environ.get("ADMIN_PASSWORD", "admin_secure_pass")
     
     if payload.username == expected_user and payload.password == expected_pass:
-        session_id = db.create_session()
+        session_id = await asyncio.to_thread(db.create_session)
         # Set session cookie (HttpOnly for security)
         is_secure = request.headers.get("x-forwarded-proto", "http") == "https"
         response.set_cookie(
@@ -182,16 +205,16 @@ async def admin_login(payload: LoginRequest, request: Request, response: Respons
 async def admin_logout(request: Request, response: Response):
     session_id = request.cookies.get("admin_session")
     if session_id:
-        db.delete_session(session_id)
+        await asyncio.to_thread(db.delete_session, session_id)
     response.delete_cookie("admin_session")
     return {"success": True, "message": "Logged out successfully"}
 
 @app.get("/api/admin/keys")
 async def get_keys(request: Request):
-    if not is_authenticated(request):
+    if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized admin session")
     
-    keys = db.get_all_keys()
+    keys = await asyncio.to_thread(db.get_all_keys)
     # Mask Quarterly key for security on the UI
     for k in keys:
         if len(k["quarterly_key"]) > 10:
@@ -200,34 +223,34 @@ async def get_keys(request: Request):
 
 @app.post("/api/admin/keys")
 async def create_key(request: Request, payload: KeyCreateRequest):
-    if not is_authenticated(request):
+    if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized admin session")
     
     if not payload.label.strip() or not payload.quarterly_key.strip():
         raise HTTPException(status_code=400, detail="Label and Quarterly key are required")
         
     try:
-        new_key = db.add_api_key(payload.label, payload.quarterly_key)
+        new_key = await asyncio.to_thread(db.add_api_key, payload.label, payload.quarterly_key)
         return new_key
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.post("/api/admin/keys/{key_id}/toggle")
 async def toggle_key(key_id: int, request: Request):
-    if not is_authenticated(request):
+    if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized admin session")
         
-    updated = db.toggle_key_status(key_id)
+    updated = await asyncio.to_thread(db.toggle_key_status, key_id)
     if not updated:
         raise HTTPException(status_code=404, detail="API key not found")
     return updated
 
 @app.delete("/api/admin/keys/{key_id}")
 async def delete_key(key_id: int, request: Request):
-    if not is_authenticated(request):
+    if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized admin session")
         
-    success = db.delete_key(key_id)
+    success = await asyncio.to_thread(db.delete_key, key_id)
     if not success:
         raise HTTPException(status_code=404, detail="API key not found")
     return {"success": True, "message": "API key deleted"}
@@ -319,7 +342,7 @@ async def get_models(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
 
     
-    key_mapping = db.get_key_by_proxy_key(proxy_key)
+    key_mapping = await asyncio.to_thread(db.get_key_by_proxy_key, proxy_key)
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid, inactive, or revoked API key.")
         
@@ -378,11 +401,11 @@ async def proxy_request(request: Request, path: str):
         raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid Bearer token or X-API-Key.")
     
     # 2. Lookup Quarterly key mapping
-    key_mapping = db.get_key_by_proxy_key(proxy_key)
+    key_mapping = await asyncio.to_thread(db.get_key_by_proxy_key, proxy_key)
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid, inactive, or revoked API key.")
     
-    # 3. Log traffic metrics
+    # 3. Log traffic metrics (in-memory update)
     db.increment_request_count(proxy_key)
     
     # Construct target URL
