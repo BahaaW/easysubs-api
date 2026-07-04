@@ -6,6 +6,12 @@ import logging
 
 logger = logging.getLogger("QuartarlyProxy.DB")
 
+# In-memory cache of active proxy key → full row mapping.
+# Eliminates SQLite file reads on the hot completion path.
+# Only non-None results are cached; never caches invalid/unknown keys.
+# Entries are removed individually on toggle/delete, or wholesale on add.
+_keys_cache: dict = {}
+
 # Determine DB location.
 # 1. Explicit environment variable check
 if os.environ.get("DATABASE_PATH"):
@@ -70,6 +76,13 @@ def generate_proxy_key() -> str:
     """Generates a secure proxy API key."""
     return f"esk-{secrets.token_hex(16)}"
 
+def _evict_key(proxy_key: str | None = None):
+    """Remove a specific key from the cache, or clear everything."""
+    if proxy_key and proxy_key in _keys_cache:
+        del _keys_cache[proxy_key]
+    elif proxy_key is None:
+        _keys_cache.clear()
+
 def add_api_key(label: str, quarterly_key: str) -> dict:
     """Creates a new proxy API key mapped to a Quarterly key."""
     conn = get_connection()
@@ -108,13 +121,25 @@ def get_all_keys() -> list:
         conn.close()
 
 def get_key_by_proxy_key(proxy_key: str) -> dict:
-    """Finds an active key mapping by proxy key."""
+    """Finds an active key mapping by proxy key.
+    
+    Checks the in-memory cache first to avoid disk I/O on every request.
+    Only caches valid (non-None) results to avoid poisoning the cache
+    with lookups for unknown or invalid keys.
+    """
+    if proxy_key in _keys_cache:
+        return _keys_cache[proxy_key]
+    
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM api_keys WHERE proxy_key = ? AND status = 'active'", (proxy_key,))
         row = cursor.fetchone()
-        return dict(row) if row else None
+        result = dict(row) if row else None
+        # Only cache valid active keys — never cache None (invalid/unknown key)
+        if result is not None:
+            _keys_cache[proxy_key] = result
+        return result
     except Exception as e:
         logger.error(f"Error fetching API key by proxy key: {e}")
         return None
@@ -128,6 +153,8 @@ def increment_request_count(proxy_key: str):
         cursor = conn.cursor()
         cursor.execute("UPDATE api_keys SET request_count = request_count + 1 WHERE proxy_key = ?", (proxy_key,))
         conn.commit()
+        # Evict stale cached row so the updated counter is visible on next lookup
+        _evict_key(proxy_key)
     except Exception as e:
         logger.error(f"Error incrementing request count: {e}")
         conn.rollback()
@@ -139,7 +166,7 @@ def toggle_key_status(key_id: int) -> dict:
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM api_keys WHERE id = ?", (key_id,))
+        cursor.execute("SELECT status, proxy_key FROM api_keys WHERE id = ?", (key_id,))
         row = cursor.fetchone()
         if not row:
             return None
@@ -147,6 +174,10 @@ def toggle_key_status(key_id: int) -> dict:
         new_status = 'disabled' if row['status'] == 'active' else 'active'
         cursor.execute("UPDATE api_keys SET status = ? WHERE id = ?", (new_status, key_id))
         conn.commit()
+        
+        # Evict just this key from cache so the next request re-reads the new status.
+        # This prevents a disabled key from being served from stale cache.
+        _evict_key(row['proxy_key'])
         
         cursor.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
         updated_row = cursor.fetchone()
@@ -163,8 +194,13 @@ def delete_key(key_id: int) -> bool:
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        # Fetch proxy_key before deleting so we can evict it from cache
+        cursor.execute("SELECT proxy_key FROM api_keys WHERE id = ?", (key_id,))
+        row = cursor.fetchone()
         cursor.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
         conn.commit()
+        if row:
+            _evict_key(row['proxy_key'])
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"Error deleting key {key_id}: {e}")

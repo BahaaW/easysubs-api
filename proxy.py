@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import httpx
 import uvicorn
@@ -55,6 +56,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress responses larger than 1KB (JSON, HTML, etc.).
+# Starlette automatically skips SSE (text/event-stream) so streaming completions are unaffected.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Initialize a global async HTTP client with a 3-minute timeout and HTTP/2 multiplexing support
 http_client = httpx.AsyncClient(timeout=180.0, http2=True)
