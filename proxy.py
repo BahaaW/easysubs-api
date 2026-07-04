@@ -77,6 +77,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EasySubs API Translation Proxy", lifespan=lifespan)
 
+# Custom Gzip Middleware that automatically bypasses LLM API routes.
+# Standard Gzip middleware buffers streaming responses (like SSE text/event-stream),
+# which stops real-time token rendering. This subclass ensures static site pages
+# still get compressed, but all API routes stream immediately.
+class SafeGZipMiddleware(GZipMiddleware):
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if "/v1/" in path or "/models" in path or "/api/" in path:
+                # Bypass compression entirely
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
 # Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
@@ -86,10 +100,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Compress responses larger than 1KB (JSON, HTML, etc.).
-# accept-encoding is stripped from forwarded headers so upstream never sends pre-compressed
-# content — no risk of double-gzip. GZipMiddleware also skips SSE (text/event-stream).
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(SafeGZipMiddleware, minimum_size=1000)
 
 TARGET_HOST = "api.quatarly.cloud"
 
@@ -449,7 +460,13 @@ async def proxy_request(request: Request, path: str):
             # stream_generator owns the response lifecycle and closes it in its finally block
             return StreamingResponse(
                 stream_generator(response),
-                status_code=response.status_code
+                status_code=response.status_code,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
             )
         else:
             try:
