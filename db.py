@@ -3,15 +3,16 @@ import sqlite3
 import secrets
 from datetime import datetime
 import logging
+import time
 
 logger = logging.getLogger("QuartarlyProxy.DB")
 
-# In-memory cache of active proxy key → full row mapping.
-# Eliminates SQLite file reads on the hot completion path.
-# Only non-None results are cached; never caches invalid/unknown keys.
-# Entries are removed individually on toggle/delete, or wholesale on add.
+# In-memory cache of active proxy key → {"data": dict, "expires_at": float}
+# Caches key configurations to eliminate SQLite reads on the hot path.
+# Uses sliding expiration: cache hits extend the lifetime by 1 hour.
 _keys_cache: dict = {}
-_MAX_CACHE_SIZE = 500  # cap prevents unbounded RAM growth if many keys are created
+_MAX_CACHE_SIZE = 500
+_CACHE_TTL = 3600  # 1 hour sliding expiration
 
 # Determine DB location.
 # 1. Explicit environment variable check
@@ -126,11 +127,18 @@ def get_key_by_proxy_key(proxy_key: str) -> dict:
     """Finds an active key mapping by proxy key.
     
     Checks the in-memory cache first to avoid disk I/O on every request.
-    Only caches valid (non-None) results to avoid poisoning the cache
-    with lookups for unknown or invalid keys.
+    Applies a sliding 1-hour expiration on hits.
     """
+    now = time.time()
     if proxy_key in _keys_cache:
-        return _keys_cache[proxy_key]
+        entry = _keys_cache[proxy_key]
+        if now < entry["expires_at"]:
+            # Slide expiration forward by another hour on hit
+            entry["expires_at"] = now + _CACHE_TTL
+            return entry["data"]
+        else:
+            # Expired
+            del _keys_cache[proxy_key]
     
     conn = get_connection()
     try:
@@ -138,12 +146,15 @@ def get_key_by_proxy_key(proxy_key: str) -> dict:
         cursor.execute("SELECT * FROM api_keys WHERE proxy_key = ? AND status = 'active'", (proxy_key,))
         row = cursor.fetchone()
         result = dict(row) if row else None
-        # Only cache valid active keys — never cache None (invalid/unknown key)
+        # Only cache valid active keys
         if result is not None:
             if len(_keys_cache) >= _MAX_CACHE_SIZE:
                 # Evict the oldest entry (dict insertion order guaranteed Python 3.7+)
                 _keys_cache.pop(next(iter(_keys_cache)))
-            _keys_cache[proxy_key] = result
+            _keys_cache[proxy_key] = {
+                "data": result,
+                "expires_at": now + _CACHE_TTL
+            }
         return result
     except Exception as e:
         logger.error(f"Error fetching API key by proxy key: {e}")
@@ -158,8 +169,11 @@ def increment_request_count(proxy_key: str):
         cursor = conn.cursor()
         cursor.execute("UPDATE api_keys SET request_count = request_count + 1 WHERE proxy_key = ?", (proxy_key,))
         conn.commit()
-        # Evict stale cached row so the updated counter is visible on next lookup
-        _evict_key(proxy_key)
+        # Update cache in-place instead of evicting to keep the cache hot!
+        if proxy_key in _keys_cache:
+            _keys_cache[proxy_key]["data"]["request_count"] += 1
+            # Also slide the expiration forward on write hits
+            _keys_cache[proxy_key]["expires_at"] = time.time() + _CACHE_TTL
     except Exception as e:
         logger.error(f"Error incrementing request count: {e}")
         conn.rollback()
