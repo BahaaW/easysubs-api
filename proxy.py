@@ -15,6 +15,9 @@ import db
 
 import asyncio
 import time
+import re
+import html
+import secrets
 
 # Global in-memory list to store the last 100 stream debug logs for troubleshooting
 debug_logs = []
@@ -319,6 +322,244 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
                             tool_call["index"] = mapped_idx
     return chunk
 
+def parse_xml_tool_calls(xml_str: str) -> list[dict]:
+    """Helper to robustly parse Claude's thinking-mode XML tool calls."""
+    # Match all <invoke name="...">...</invoke> blocks
+    invokes = re.findall(r'<invoke name="([^"]+)"\s*>(.*?)</invoke>', xml_str, re.DOTALL)
+    results = []
+    for name, content in invokes:
+        # Match all <parameter name="...">...</parameter> blocks inside this invoke
+        params = re.findall(r'<parameter name="([^"]+)"\s*>(.*?)</parameter>', content, re.DOTALL)
+        arguments = {}
+        for param_name, param_value in params:
+            val = html.unescape(param_value.strip())
+            try:
+                # If value is stringified JSON (array/object), load it
+                arguments[param_name] = json.loads(val)
+            except Exception:
+                arguments[param_name] = val
+        results.append({
+            "name": name,
+            "arguments": arguments
+        })
+    return results
+
+class XMLToJSONConverter:
+    """Detects, buffers, and translates Claude's XML function calls into standard JSON chunks."""
+    def __init__(self, is_openai_format: bool = True):
+        self.is_openai_format = is_openai_format
+        self.in_xml = False
+        self.text_buffer = ""
+        self.xml_buffer = ""
+        self.tool_call_index = 0
+
+    def process_chunk_text(self, text: str) -> tuple[str, list[dict]]:
+        """Processes incoming text chunk. Returns tuple of (clean_text_to_yield, list_of_tool_call_chunks)."""
+        if not self.in_xml:
+            self.text_buffer += text
+            
+            # Find the first '<' in the buffer
+            idx = self.text_buffer.find("<")
+            if idx == -1:
+                # No '<' found, flush the entire text buffer immediately (zero latency)
+                to_yield = self.text_buffer
+                self.text_buffer = ""
+                return to_yield, []
+            else:
+                # Found a '<'. Check if the text matches the prefix of "<function_calls>"
+                slice_to_check = self.text_buffer[idx:]
+                target = "<function_calls>"
+                
+                if target.startswith(slice_to_check):
+                    # We are potentially building the tag, yield the prefix and hold the rest
+                    to_yield = self.text_buffer[:idx]
+                    self.text_buffer = slice_to_check
+                    return to_yield, []
+                elif "<function_calls" in self.text_buffer:
+                    # Tag completed, split it
+                    parts = self.text_buffer.split("<function_calls", 1)
+                    text_to_yield = parts[0]
+                    self.in_xml = True
+                    self.xml_buffer = ""
+                    rest = parts[1]
+                    if ">" in rest:
+                        self.xml_buffer = rest.split(">", 1)[1]
+                    else:
+                        self.xml_buffer = rest
+                    self.text_buffer = ""
+                    
+                    # Immediately process the xml_buffer in case the tag closing is already present
+                    xml_text, xml_chunks = self.process_chunk_text("")
+                    return text_to_yield + xml_text, xml_chunks
+                else:
+                    # Not a tag match, flush the buffer
+                    to_yield = self.text_buffer
+                    self.text_buffer = ""
+                    return to_yield, []
+        else:
+            self.xml_buffer += text
+            if "</function_calls>" in self.xml_buffer:
+                self.in_xml = False
+                parts = self.xml_buffer.split("</function_calls>", 1)
+                xml_to_parse = parts[0]
+                remaining_text = parts[1]
+                
+                # Parse the complete XML block and generate output JSON chunks
+                tool_calls = parse_xml_tool_calls(xml_to_parse)
+                chunks = self.generate_tool_call_chunks(tool_calls)
+                
+                self.xml_buffer = ""
+                self.text_buffer = ""
+                
+                # Recursively process any remaining text
+                rem_text, rem_chunks = self.process_chunk_text(remaining_text)
+                return rem_text, chunks + rem_chunks
+            else:
+                return "", []
+
+    def flush(self, message_id: str = None) -> tuple[str, list[dict]]:
+        """Flushes any remaining text when the stream ends."""
+        if not self.in_xml:
+            to_yield = self.text_buffer
+            self.text_buffer = ""
+            return to_yield, []
+        else:
+            # Stream ended inside XML mode (malformed tag). Return it as raw text.
+            raw_text = "<function_calls" + self.xml_buffer
+            self.in_xml = False
+            self.xml_buffer = ""
+            return raw_text, []
+
+    def generate_tool_call_chunks(self, tool_calls: list[dict], message_id: str = None) -> list[dict]:
+        chunks = []
+        if not tool_calls:
+            return chunks
+
+        if self.is_openai_format:
+            openai_tool_calls = []
+            for i, tc in enumerate(tool_calls):
+                openai_tool_calls.append({
+                    "index": self.tool_call_index + i,
+                    "id": f"call_{secrets.token_hex(12)}",
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"])
+                    }
+                })
+            self.tool_call_index += len(tool_calls)
+            
+            chunks.append({
+                "id": message_id or f"chatcmpl-{secrets.token_hex(12)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": openai_tool_calls
+                    },
+                    "finish_reason": None
+                }]
+            })
+        else:
+            # Anthropic tool use chunks sequence
+            for tc in tool_calls:
+                call_id = f"toolu_{secrets.token_hex(12)}"
+                block_index = self.tool_call_index
+                self.tool_call_index += 1
+                
+                chunks.append({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": tc["name"],
+                        "input": {}
+                    }
+                })
+                chunks.append({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(tc["arguments"])
+                    }
+                })
+                chunks.append({
+                    "type": "content_block_stop",
+                    "index": block_index
+                })
+        return chunks
+
+def convert_xml_to_json_non_streaming(response_json: dict) -> dict:
+    """Intercepts and parses XML tool calls for non-streaming completions."""
+    if not isinstance(response_json, dict):
+        return response_json
+        
+    # 1. OpenAI Format
+    if "choices" in response_json and isinstance(response_json["choices"], list) and len(response_json["choices"]) > 0:
+        choice = response_json["choices"][0]
+        if "message" in choice and isinstance(choice["message"], dict):
+            message = choice["message"]
+            content = message.get("content") or ""
+            if "<function_calls" in content and "</function_calls>" in content:
+                parts = content.split("<function_calls", 1)
+                text_before = parts[0]
+                rest = parts[1].split("</function_calls>", 1)
+                xml_to_parse = rest[0].split(">", 1)[1] if ">" in rest[0] else rest[0]
+                text_after = rest[1] if len(rest) > 1 else ""
+                
+                tool_calls = parse_xml_tool_calls(xml_to_parse)
+                if tool_calls:
+                    message["content"] = (text_before + text_after).strip() or None
+                    openai_tool_calls = []
+                    for i, tc in enumerate(tool_calls):
+                        openai_tool_calls.append({
+                            "id": f"call_{secrets.token_hex(12)}",
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc["arguments"])
+                            }
+                        })
+                    message["tool_calls"] = openai_tool_calls
+                    
+    # 2. Anthropic Format
+    elif "content" in response_json and isinstance(response_json["content"], list):
+        new_content = []
+        for item in response_json["content"]:
+            if isinstance(item, dict) and item.get("type") == "text":
+                content = item.get("text") or ""
+                if "<function_calls" in content and "</function_calls>" in content:
+                    parts = content.split("<function_calls", 1)
+                    text_before = parts[0]
+                    rest = parts[1].split("</function_calls>", 1)
+                    xml_to_parse = rest[0].split(">", 1)[1] if ">" in rest[0] else rest[0]
+                    text_after = rest[1] if len(rest) > 1 else ""
+                    
+                    if text_before.strip():
+                        new_content.append({"type": "text", "text": text_before.strip()})
+                        
+                    tool_calls = parse_xml_tool_calls(xml_to_parse)
+                    for tc in tool_calls:
+                        new_content.append({
+                            "type": "tool_use",
+                            "id": f"toolu_{secrets.token_hex(12)}",
+                            "name": tc["name"],
+                            "input": tc["arguments"]
+                        })
+                        
+                    if text_after.strip():
+                        new_content.append({"type": "text", "text": text_after.strip()})
+                else:
+                    new_content.append(item)
+            else:
+                new_content.append(item)
+        response_json["content"] = new_content
+        
+    return response_json
+
 # Models endpoints (OpenAI-compatible)
 @app.get("/v1/models")
 @app.get("/models")
@@ -451,6 +692,10 @@ async def proxy_request(request: Request, path: str):
     async def stream_generator(response: httpx.Response) -> Any:
         """Yields SSE lines to the client and ensures the upstream response is always closed."""
         mapper = ToolCallIndexMapper()
+        converter = None
+        is_openai = True
+        last_message_id = None
+        
         try:
             async for line in response.aiter_lines():
                 if not line:
@@ -467,13 +712,82 @@ async def proxy_request(request: Request, path: str):
                 if line.startswith("data:"):
                     data_str = line[5:].strip()
                     if data_str == "[DONE]":
+                        # Flush the converter before ending the stream
+                        if converter:
+                            rem_text, rem_chunks = converter.flush(message_id=last_message_id)
+                            if rem_text:
+                                if is_openai:
+                                    flush_chunk = {
+                                        "id": last_message_id or f"chatcmpl-{secrets.token_hex(12)}",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": rem_text},
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                else:
+                                    flush_chunk = {
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {
+                                            "type": "text_delta",
+                                            "text": rem_text
+                                        }
+                                    }
+                                yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
+                            
+                            for c in rem_chunks:
+                                yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                        
                         yield f"{line}\n\n".encode("utf-8")
                         continue
+                        
                     try:
                         chunk = json.loads(data_str)
                         sanitized = sanitize_json(chunk)
                         sanitized = map_chunk_tool_calls(sanitized, mapper)
-                        yield f"data: {json.dumps(sanitized)}\n\n".encode("utf-8")
+                        
+                        # Initialize converter on first chunk
+                        if converter is None:
+                            is_openai = "choices" in sanitized
+                            converter = XMLToJSONConverter(is_openai_format=is_openai)
+                        
+                        if is_openai:
+                            last_message_id = sanitized.get("id") or last_message_id
+                            
+                        # Extract and process text delta
+                        text = ""
+                        if is_openai:
+                            if "choices" in sanitized and len(sanitized["choices"]) > 0:
+                                choice = sanitized["choices"][0]
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    text = choice["delta"]["content"] or ""
+                        else:
+                            if sanitized.get("type") == "content_block_delta":
+                                delta = sanitized.get("delta", {})
+                                if delta.get("type") == "text_delta":
+                                    text = delta.get("text") or ""
+                                    
+                        if text:
+                            text_to_yield, chunks_to_yield = converter.process_chunk_text(text)
+                            
+                            # Update current chunk
+                            if is_openai:
+                                sanitized["choices"][0]["delta"]["content"] = text_to_yield
+                            else:
+                                sanitized["delta"]["text"] = text_to_yield
+                                
+                            # Yield modified chunk first
+                            yield f"data: {json.dumps(sanitized)}\n\n".encode("utf-8")
+                            
+                            # Then yield any generated tool call chunks
+                            for c in chunks_to_yield:
+                                yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                        else:
+                            yield f"data: {json.dumps(sanitized)}\n\n".encode("utf-8")
+                            
                     except Exception as e:
                         logger.warning(f"Failed to parse chunk JSON: {data_str}. Error: {e}")
                         yield f"{line}\n\n".encode("utf-8")
@@ -511,9 +825,10 @@ async def proxy_request(request: Request, path: str):
             try:
                 await response.aread()
                 try:
-                    # Attempt to parse as JSON and sanitize
+                    # Attempt to parse as JSON, sanitize and convert XML to JSON
                     response_json = response.json()
                     response_json = sanitize_json(response_json)
+                    response_json = convert_xml_to_json_non_streaming(response_json)
                     return JSONResponse(
                         content=response_json,
                         status_code=response.status_code
