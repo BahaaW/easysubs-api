@@ -1,6 +1,7 @@
 # EasySubs API - Project Primer
-**Status**: Admin dashboard, translation proxy, HTTP/2 multiplexing, sliding cache, real-time streaming, thread offloads, and batch flusher complete.
+**Status**: Admin dashboard, translation proxy, HTTP/2 multiplexing, sliding cache, real-time streaming, thread offloads, batch flusher, and XML-to-JSON tool parser complete.
 **Completed this session**:
+- Added an XML-to-JSON Stream Converter (`XMLToJSONConverter`) to intercept, buffer, parse, and translate Claude's XML function calls (`<function_calls>` and `<invoke>`) into standard JSON chunks. Enables tool use during active thinking modes.
 - Offloaded all blocking SQLite file I/O operations to worker threads via `asyncio.to_thread` to prevent freezing the FastAPI event loop.
 - Implemented write buffering for request counts in RAM, writing to disk in a single batch every 10 seconds (saving up to 99% I/O overhead).
 - Tuned HTTPX connection limits to `max_keepalive_connections=100` and `max_connections=500` for high concurrency.
