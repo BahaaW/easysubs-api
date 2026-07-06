@@ -1391,47 +1391,120 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
 # XML → JSON conversion (Claude's non-standard streaming format)
 # ---------------------------------------------------------------------------
 
-def parse_xml_tool_calls(xml_str: str) -> list[dict[str, Any]]:
-    """Parses Claude's <invoke name="...">...</invoke> XML blocks.
+# Known Claude Code tool names — used to detect bare tool XML tags
+# (e.g. <write_to_file><path>...</path><content>...</content></write_to_file>)
+_CLAUDE_CODE_TOOLS: set[str] = {
+    "write_to_file",
+    "read_file",
+    "replace_in_file",
+    "execute_command",
+    "search_files",
+    "list_files",
+    "delete_files",
+    "run_terminal",
+    "web_search",
+    "web_fetch",
+    "ask_followup_question",
+    "task",
+    "todo_write",
+    "edit_file",
+    "create_rule",
+    "update_memory",
+    "preview_url",
+    "use_skill",
+}
 
-    Handles:
-    - <invoke name="..."> with nested <parameter name="...">...</parameter>
-    - Nested XML inside parameter values (CDATA-like, escaped entities)
+
+def parse_claude_code_xml_tool_calls(xml_str: str) -> list[dict[str, Any]]:
+    """Parses Claude Code's native tool XML format where the tool name is the tag name.
+
+    Example:
+        <write_to_file>
+          <path>random1.txt</path>
+          <content>The quick brown fox...</content>
+        </write_to_file>
+
+    Returns a list of {"name": str, "arguments": dict} dicts.
     """
-    invokes = re.findall(
-        r'<invoke name="([^"]+)"\s*>(.*?)</invoke>', xml_str, re.DOTALL
+    results: list[dict[str, Any]] = []
+    # Build a regex alternation of all known tool names
+    tool_names = "|".join(re.escape(t) for t in sorted(_CLAUDE_CODE_TOOLS, key=len, reverse=True))
+    pattern = re.compile(
+        rf'<({tool_names})>\s*(.*?)\s*</\1>',
+        re.DOTALL,
     )
-    results = []
-    for name, content in invokes:
-        params = re.findall(
-            r'<parameter name="([^"]+)"\s*>(.*?)</parameter>', content, re.DOTALL
+    for match in pattern.finditer(xml_str):
+        tool_name = match.group(1)
+        inner = match.group(2)
+        # Parse child tags as parameters
+        arguments: dict[str, Any] = {}
+        child_pattern = re.compile(
+            r'<(\w+)>(.*?)</\1>',
+            re.DOTALL,
         )
-        arguments = {}
-        for param_name, param_value in params:
-            val = html.unescape(param_value.strip())
+        for child in child_pattern.finditer(inner):
+            param_name = child.group(1)
+            param_value = html.unescape(child.group(2).strip())
             try:
-                arguments[param_name] = json.loads(val)
+                arguments[param_name] = json.loads(param_value)
             except (json.JSONDecodeError, TypeError):
-                arguments[param_name] = val
-        results.append({"name": name, "arguments": arguments})
+                arguments[param_name] = param_value
+        results.append({"name": tool_name, "arguments": arguments})
     return results
 
 
-class XMLToJSONConverter:
-    """Converts Claude's XML function_calls format to OpenAI-compatible JSON.
+def parse_xml_tool_calls(xml_str: str) -> list[dict[str, Any]]:
+    """Parses Claude's XML tool call blocks.
 
-    Claude streams XML blocks like:
-        <function_calls>
-          <invoke name="get_weather">...</invoke>
-        </function_calls>
+    Handles two formats:
+    1. Legacy: <function_calls><invoke name="X"><parameter name="Y">Z</parameter></invoke></function_calls>
+    2. Claude Code native: <write_to_file><path>...</path><content>...</content></write_to_file>
+
+    Returns a list of {"name": str, "arguments": dict} dicts.
+    """
+    # Try legacy <invoke> format first
+    invokes = re.findall(
+        r'<invoke name="([^"]+)"\s*>(.*?)</invoke>', xml_str, re.DOTALL
+    )
+    if invokes:
+        results = []
+        for name, content in invokes:
+            params = re.findall(
+                r'<parameter name="([^"]+)"\s*>(.*?)</parameter>', content, re.DOTALL
+            )
+            arguments = {}
+            for param_name, param_value in params:
+                val = html.unescape(param_value.strip())
+                try:
+                    arguments[param_name] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    arguments[param_name] = val
+            results.append({"name": name, "arguments": arguments})
+        return results
+
+    # Try Claude Code native format
+    return parse_claude_code_xml_tool_calls(xml_str)
+
+
+class XMLToJSONConverter:
+    """Converts Claude's XML tool-call format to OpenAI/Anthropic JSON chunks.
+
+    Handles two XML formats:
+    1. Legacy: <function_calls><invoke name="X"><parameter name="Y">Z</parameter></invoke></function_calls>
+    2. Claude Code native: <write_to_file><path>...</path><content>...</content></write_to_file>
 
     This converter:
-    1. Buffers incoming text, detecting the <function_calls> tag
-    2. On </function_calls>, parses the XML and emits synthetic JSON chunks
-    3. Correctly handles MULTIPLE <function_calls> blocks in one stream
+    1. Buffers incoming text, detecting XML tool tags
+    2. On closing tag, parses the XML and emits synthetic JSON chunks
+    3. Correctly handles MULTIPLE tool blocks in one stream
 
     Supports both OpenAI (chat.completion.chunk) and Anthropic streaming formats.
     """
+
+    # Regex to detect the START of any known tool XML tag (legacy or native)
+    _TOOL_TAG_START = re.compile(
+        r'<(function_calls|' + '|'.join(re.escape(t) for t in sorted(_CLAUDE_CODE_TOOLS, key=len, reverse=True)) + r')\b',
+    )
 
     def __init__(self, is_openai_format: bool = True) -> None:
         self.is_openai_format = is_openai_format
@@ -1439,6 +1512,7 @@ class XMLToJSONConverter:
         self.text_buffer = ""
         self.xml_buffer = ""
         self.tool_call_index = 0
+        self._xml_tag_name: str = ""  # tracks which tag we're inside (e.g. "function_calls" or "write_to_file")
 
     def process_chunk_text(self, text: str) -> tuple[str, list[dict[str, Any]]]:
         """Process incoming text. Returns (text_to_yield, tool_call_chunks).
@@ -1458,54 +1532,54 @@ class XMLToJSONConverter:
                 return to_yield, []
 
             slice_to_check = self.text_buffer[idx:]
-            target = "<function_calls>"
 
-            if target.startswith(slice_to_check) and slice_to_check != target:
-                # Potentially starting the tag — hold text until confirmed
-                to_yield = self.text_buffer[:idx]
-                self.text_buffer = slice_to_check
-                return to_yield, []
-
-            elif "<function_calls" in self.text_buffer:
-                # Tag found — split and enter XML mode
-                parts = self.text_buffer.split("<function_calls", 1)
-                text_to_yield = parts[0]
-                self.in_xml = True
-                self.xml_buffer = ""
-                rest = parts[1]
-
-                if ">" in rest:
-                    self.xml_buffer = rest.split(">", 1)[1]
-                else:
-                    self.xml_buffer = rest
-                self.text_buffer = ""
-
-                # If the closing tag is already in the buffer, process immediately
-                if "</function_calls>" in self.xml_buffer:
-                    xml_text, xml_chunks = self._process_xml_buffer()
-                    return text_to_yield + xml_text, xml_chunks
-                return text_to_yield, []
-
-            else:
-                # Not a function_calls tag — flush and reset
+            # Check if we're starting a known tool tag
+            m = self._TOOL_TAG_START.search(self.text_buffer)
+            if not m:
+                # No known tool tag — flush and reset
                 to_yield = self.text_buffer
                 self.text_buffer = ""
                 return to_yield, []
+
+            tag_name = m.group(1)
+            tag_start = m.start()
+
+            # Yield text before the tag
+            text_to_yield = self.text_buffer[:tag_start]
+            self.in_xml = True
+            self._xml_tag_name = tag_name
+            self.xml_buffer = self.text_buffer[m.end():]
+            self.text_buffer = ""
+
+            # If the closing tag is already in the buffer, process immediately
+            closing_tag = f"</{tag_name}>"
+            if closing_tag in self.xml_buffer:
+                xml_text, xml_chunks = self._process_xml_buffer()
+                return text_to_yield + xml_text, xml_chunks
+            return text_to_yield, []
         else:
             # In XML mode — accumulate until closing tag
             self.xml_buffer += text
 
-            if "</function_calls>" in self.xml_buffer:
+            closing_tag = f"</{self._xml_tag_name}>"
+            if closing_tag in self.xml_buffer:
                 return self._process_xml_buffer()
 
             return "", []
 
     def _process_xml_buffer(self) -> tuple[str, list[dict[str, Any]]]:
-        """Splits at </function_calls>, parses XML, returns text + tool chunks."""
+        """Splits at closing tag, parses XML, returns text + tool chunks."""
         self.in_xml = False
-        parts = self.xml_buffer.split("</function_calls>", 1)
+        tag_name = self._xml_tag_name
+        closing_tag = f"</{tag_name}>"
+        parts = self.xml_buffer.split(closing_tag, 1)
         xml_to_parse = parts[0]
         remaining_text = parts[1] if len(parts) > 1 else ""
+
+        # For legacy <function_calls> format, the actual tool XML is inside the tag.
+        # For native format (e.g. <write_to_file>), the tag IS the tool — reconstruct it.
+        if tag_name != "function_calls":
+            xml_to_parse = f"<{tag_name}>{xml_to_parse}</{tag_name}>"
 
         # Parse and generate chunks
         tool_calls = parse_xml_tool_calls(xml_to_parse)
@@ -1513,9 +1587,10 @@ class XMLToJSONConverter:
 
         self.xml_buffer = ""
         self.text_buffer = ""
+        self._xml_tag_name = ""
 
-        # Recursively process any text that came after </function_calls>
-        # This handles multiple <function_calls> blocks correctly
+        # Recursively process any text that came after the closing tag.
+        # This handles multiple tool blocks in one stream correctly.
         rem_text, rem_chunks = self.process_chunk_text(remaining_text)
         return rem_text, chunks + rem_chunks
 
@@ -1527,10 +1602,12 @@ class XMLToJSONConverter:
             return to_yield, []
         else:
             # Malformed stream that ended mid-XML
-            raw_text = "<function_calls" + self.xml_buffer
+            tag_name = self._xml_tag_name
+            raw_text = f"<{tag_name}>{self.xml_buffer}"
             self.in_xml = False
             self.xml_buffer = ""
             self.text_buffer = ""
+            self._xml_tag_name = ""
             return raw_text, []
 
     def generate_tool_call_chunks(
@@ -1603,9 +1680,42 @@ def convert_xml_to_json_non_streaming(response_json: dict) -> dict:
     """Converts XML tool calls in non-streaming completions to JSON.
 
     Handles both OpenAI (chat.completion) and Anthropic (messages) formats.
+    Detects both legacy <function_calls><invoke> and native <write_to_file> XML.
     """
     if not isinstance(response_json, dict):
         return response_json
+
+    # Build a regex to find any known tool XML tag in content
+    _any_tool_tag = re.compile(
+        r'<(function_calls|' + '|'.join(re.escape(t) for t in sorted(_CLAUDE_CODE_TOOLS, key=len, reverse=True)) + r')\b',
+    )
+
+    def _extract_tool_calls_from_text(content_text: str) -> tuple[str, list[dict], str]:
+        """Extracts tool calls from text content. Returns (text_before, tool_calls, text_after)."""
+        m = _any_tool_tag.search(content_text)
+        if not m:
+            return content_text, [], ""
+
+        tag_name = m.group(1)
+        tag_start = m.start()
+        text_before = content_text[:tag_start]
+
+        # Find the matching closing tag
+        closing_tag = f"</{tag_name}>"
+        closing_idx = content_text.find(closing_tag, m.end())
+        if closing_idx == -1:
+            return content_text, [], ""
+
+        inner = content_text[m.end():closing_idx]
+        text_after = content_text[closing_idx + len(closing_tag):]
+
+        if tag_name == "function_calls":
+            xml_to_parse = inner
+        else:
+            xml_to_parse = f"<{tag_name}>{inner}</{tag_name}>"
+
+        tool_calls = parse_xml_tool_calls(xml_to_parse)
+        return text_before, tool_calls, text_after
 
     # ---- OpenAI format ----
     if "choices" in response_json and isinstance(response_json["choices"], list):
@@ -1613,14 +1723,8 @@ def convert_xml_to_json_non_streaming(response_json: dict) -> dict:
         if "message" in choice and isinstance(choice["message"], dict):
             message = choice["message"]
             content = message.get("content") or ""
-            if "<function_calls>" in content and "</function_calls>" in content:
-                parts = content.split("<function_calls>", 1)
-                text_before = parts[0]
-                rest = parts[1].split("</function_calls>", 1)
-                xml_to_parse = rest[0].split(">", 1)[1] if ">" in rest[0] else rest[0]
-                text_after = rest[1] if len(rest) > 1 else ""
-
-                tool_calls = parse_xml_tool_calls(xml_to_parse)
+            if isinstance(content, str):
+                text_before, tool_calls, text_after = _extract_tool_calls_from_text(content)
                 if tool_calls:
                     message["content"] = (text_before + text_after).strip() or None
                     openai_tcs = []
@@ -1641,17 +1745,12 @@ def convert_xml_to_json_non_streaming(response_json: dict) -> dict:
         for item in response_json["content"]:
             if isinstance(item, dict) and item.get("type") == "text":
                 content_text = item.get("text") or ""
-                if "<function_calls>" in content_text and "</function_calls>" in content_text:
-                    parts = content_text.split("<function_calls>", 1)
-                    text_before = parts[0]
-                    rest = parts[1].split("</function_calls>", 1)
-                    xml_to_parse = rest[0].split(">", 1)[1] if ">" in rest[0] else rest[0]
-                    text_after = rest[1] if len(rest) > 1 else ""
+                text_before, tool_calls, text_after = _extract_tool_calls_from_text(content_text)
 
+                if tool_calls:
                     if text_before.strip():
                         new_content.append({"type": "text", "text": text_before.strip()})
 
-                    tool_calls = parse_xml_tool_calls(xml_to_parse)
                     for tc in tool_calls:
                         new_content.append({
                             "type": "tool_use",
