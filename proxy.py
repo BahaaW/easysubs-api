@@ -112,10 +112,11 @@ _ip_brute_force: dict[str, dict[str, Any]] = {}
 # Per-key sliding-window rate limit tracking: proxy_key -> request timestamps
 _key_request_history: dict[str, list[float]] = {}
 
-# /v1/models response cache (process-wide TTL cache)
+# /v1/models response cache (process-wide TTL cache, guarded by _models_lock)
 _models_cache: dict | None = None
 _models_cache_expires: float = 0.0
 _MODELS_CACHE_TTL: float = 300.0  # 5 minutes
+_models_lock: asyncio.Lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # Debug / tracing
@@ -642,10 +643,6 @@ async def list_models(request: Request) -> JSONResponse:
     """Returns the list of available models. Fetches from upstream with TTL cache."""
     global _models_cache, _models_cache_expires
 
-    client_ip = get_client_ip(request)
-    if is_proxy_rate_limited(client_ip):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
-
     proxy_key = _extract_proxy_key(request)
     if not proxy_key:
         raise HTTPException(
@@ -657,26 +654,32 @@ async def list_models(request: Request) -> JSONResponse:
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
 
-    # Return cached result if still fresh
+    client_ip = get_client_ip(request)
+    if is_proxy_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
+    # Check the TTL cache under a lock so concurrent requests don't race
+    # (one sees None while another is mid-write).
     now = time.time()
-    if _models_cache is not None and now < _models_cache_expires:
-        return JSONResponse(_models_cache)
+    async with _models_lock:
+        if _models_cache is not None and now < _models_cache_expires:
+            return JSONResponse(_models_cache)
 
-    target_url = f"{config.TARGET_SCHEME}://{config.TARGET_HOST}/v1/models"
-    headers = {
-        "authorization": f"Bearer {key_mapping['quarterly_key']}",
-        "x-api-key": key_mapping["quarterly_key"],
-    }
+        target_url = f"{config.TARGET_SCHEME}://{config.TARGET_HOST}/v1/models"
+        headers = {
+            "authorization": f"Bearer {key_mapping['quarterly_key']}",
+            "x-api-key": key_mapping["quarterly_key"],
+        }
 
-    try:
-        resp = await _http_client.get(target_url, headers=headers, timeout=10.0)
-        if resp.status_code == 200:
-            payload = resp.json()
-            _models_cache = payload
-            _models_cache_expires = now + _MODELS_CACHE_TTL
-            return JSONResponse(payload)
-    except Exception as e:
-        logger.warning("Failed to fetch models from upstream: %s", e)
+        try:
+            resp = await _http_client.get(target_url, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                payload = resp.json()
+                _models_cache = payload
+                _models_cache_expires = now + _MODELS_CACHE_TTL
+                return JSONResponse(payload)
+        except Exception as e:
+            logger.warning("Failed to fetch models from upstream: %s", e)
 
     # Fallback to IMPPP.txt-derived list
     fallback = {"object": "list", "data": config.FALLBACK_MODELS}
@@ -730,13 +733,21 @@ async def proxy_request(request: Request, path: str) -> Response:
         raise HTTPException(status_code=429, detail="Per-key rate limit exceeded.")
 
     # ---- Per-key daily quota check (delegated to DB layer) ----
-    within_quota = await asyncio.to_thread(db.increment_request_count, proxy_key)
+    within_quota, flush_needed = await asyncio.to_thread(
+        db.increment_request_count, proxy_key
+    )
     if not within_quota:
         quota = key_mapping.get("quota_limit") or 0
         raise HTTPException(
             status_code=429,
             detail=f"Daily quota ({quota}) exceeded for this proxy key.",
         )
+
+    # Flush immediately if we've hit the per-key threshold. This bounds data loss
+    # on crash to at most FLUSH_EVERY_N increments per key, regardless of when
+    # the next periodic flush fires.
+    if flush_needed:
+        await asyncio.to_thread(db.flush_pending_increments)
 
     # ---- Normalize path (handle missing /v1/ prefix for some clients) ----
     if not path.startswith("v1/") and path in _BARE_PATHS:
@@ -966,6 +977,17 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
+    # Bedrock Converse API does not support tools at all with thinking models.
+    # If a thinking-model request carries tools/tool blocks, strip tools and
+    # convert the history to plain text so Bedrock doesn't see toolUse/toolResult
+    # blocks without a toolConfig.
+    if is_thinking and has_tools:
+        data.pop("tools", None)
+        data.pop("tool_choice", None)
+        if "messages" in data and isinstance(data["messages"], list):
+            data["messages"] = _convert_tool_blocks_to_text(data["messages"])
+        return data
+
     # Bedrock Converse API does not support *generic* forced tool choice
     # (any/required/function — i.e. "call some tool") with thinking models.
     # However, a SPECIFIC tool force (Anthropic type:"tool" with a name, or
@@ -998,7 +1020,7 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     if not has_tools:
         if "messages" in data and isinstance(data["messages"], list):
             data["messages"] = _convert_tool_blocks_to_text(data["messages"])
-    
+
     return data
 
 

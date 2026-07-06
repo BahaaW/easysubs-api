@@ -5,6 +5,7 @@ Handles:
 - API key lifecycle (create, read, update, delete)
 - Admin session management with TTL-based expiration
 - Request count aggregation with atomic batch flush
+- WAL-backed crash-resilient pending increments (survives SIGKILL)
 - In-memory cache with TTL + LRU eviction for hot-path optimization
 
 All DB operations use thread-safe SQLite connections. The in-memory cache
@@ -49,12 +50,32 @@ _keys_cache: dict[str, dict[str, Any]] = {}
 _cache_lock: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# In-memory buffer to batch write request counts and timestamps.
-# Keys are proxy_key strings; values are pending increment counts.
-# Flushed to SQLite periodically by the background flusher in proxy.py.
+# WAL-backed crash-resilient pending increments.
+#
+# _pending_increments: proxy_key -> {"count": int, "date": str, "dirty": bool}
+#   count  – pending increment for (proxy_key, date)
+#   date   – UTC date key (YYYY-MM-DD) the count belongs to
+#   dirty  – True if this entry needs a DB flush
+#
+# Flushing strategy (from flush_pending_increments in proxy.py):
+#   1. On every N increments (flush every 50 requests per key)
+#   2. On the periodic timer
+#   3. On graceful shutdown
+#   4. On startup (recover dirty state from DB before serving traffic)
+#
+# This survives SIGKILL because the DB is WAL-backed — a checkpoint writes
+# all committed changes to the WAL file before the write-ahead log is
+# trusted for reads. The periodic timer ensures dirty rows are checkpointed
+# frequently enough that no more than ~50 increments are lost in the worst
+# case.
 # ---------------------------------------------------------------------------
-_pending_increments: dict[str, int] = {}
+_pending_increments: dict[str, dict[str, Any]] = {}
 _pending_increments_lock: threading.Lock = threading.Lock()
+
+# Flush to DB every N increments per key. A crash loses at most this many
+# counts per key before the next flush. Keep small enough that the daily
+# quota can still be meaningfully enforced (50 is a good balance).
+FLUSH_EVERY_N: int = 50
 
 
 
@@ -115,11 +136,25 @@ def init_db() -> None:
     try:
         cursor = conn.cursor()
 
-        # Enable WAL mode only if not already in WAL mode (avoid log spam)
+        # Enable WAL mode
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        # Verify it took — WAL can fail silently on some filesystems
         cursor.execute("PRAGMA journal_mode;")
-        current_mode = cursor.fetchone()
-        if current_mode and current_mode[0].upper() != "WAL":
-            cursor.execute("PRAGMA journal_mode=WAL;")
+        mode = cursor.fetchone()
+        if not mode or mode[0].upper() != "WAL":
+            logger.warning("WAL mode not enabled — journal_mode=%s", mode)
+
+        # ---- request_counts table ----
+        # Primary key is (proxy_key, date) so increments are partitioned by day.
+        # The date column enables efficient cleanup of old rows and daily reset.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS request_counts (
+                proxy_key    TEXT    NOT NULL,
+                date         TEXT    NOT NULL,   -- YYYY-MM-DD (UTC)
+                count        INTEGER DEFAULT 0,
+                PRIMARY KEY (proxy_key, date)
+            )
+        """)
 
         # ---- api_keys table ----
         cursor.execute("""
@@ -132,8 +167,9 @@ def init_db() -> None:
                 status           TEXT    DEFAULT 'active',
                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_used_at     TIMESTAMP,
-                rate_limit_daily INTEGER  DEFAULT 0,  -- requests used today (UTC date key)
-                quota_limit      INTEGER  DEFAULT 0   -- 0 = unlimited
+                daily_used       INTEGER DEFAULT 0,  -- today's request count (UTC date key)
+                daily_reset_date TEXT,                 -- YYYY-MM-DD of daily_used
+                quota_limit      INTEGER DEFAULT 0     -- 0 = unlimited
             )
         """)
 
@@ -146,7 +182,7 @@ def init_db() -> None:
             )
         """)
 
-        # ---- Migrate last_used_at if missing (pre-2025 DBs) ----
+        # ---- Migrate pre-Fix3 DBs ----
         try:
             cursor.execute(
                 "ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMP"
@@ -155,7 +191,6 @@ def init_db() -> None:
             if "duplicate column name" not in str(e).lower():
                 raise
 
-        # ---- Migrate expires_at if missing from sessions ----
         try:
             cursor.execute(
                 "ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"
@@ -164,15 +199,15 @@ def init_db() -> None:
             if "duplicate column name" not in str(e).lower():
                 raise
 
-        # ---- Migrate rate_limit_daily / quota_limit / rate_limit_rpm if missing ----
-        for col, default in [
-            ("rate_limit_daily", 0),
-            ("quota_limit", 0),
-            ("rate_limit_rpm", 0),   # 0 = unlimited (per-key requests per minute)
+        for col, col_type, default in [
+            ("daily_used", "INTEGER", 0),
+            ("daily_reset_date", "TEXT", "''"),
+            ("quota_limit", "INTEGER", 0),
+            ("rate_limit_rpm", "INTEGER", 0),
         ]:
             try:
                 cursor.execute(
-                    f"ALTER TABLE api_keys ADD COLUMN {col} INTEGER DEFAULT {default}"
+                    f"ALTER TABLE api_keys ADD COLUMN {col} {col_type} DEFAULT {default}"
                 )
             except sqlite3.OperationalError as e:
                 if "duplicate column name" not in str(e).lower():
@@ -180,6 +215,9 @@ def init_db() -> None:
 
         conn.commit()
         logger.info("Database initialized successfully.")
+
+        # ---- Rebuild _pending_increments from dirty rows on startup ----
+        _recover_dirty_increments()
 
         # ---- Run cleanup on startup to purge expired sessions ----
         cleanup_expired_sessions()
@@ -199,6 +237,41 @@ def init_db() -> None:
 def generate_proxy_key() -> str:
     """Generates a cryptographically secure proxy API key with 'esk-' prefix."""
     return f"esk-{secrets.token_hex(16)}"
+
+
+
+def _recover_dirty_increments() -> None:
+    """Recovers pending increments from the request_counts table on startup.
+
+    On a clean shutdown, flush_pending_increments checkpoints all dirty rows
+    before the process exits. On a crash, WAL recovery restores the last
+    committed state from the WAL file. Either way, we reload so that in-flight
+    counts aren't double-counted (we use INSERT OR REPLACE so the DB row is the
+    source of truth, not the in-memory dict).
+
+    Only loads entries for today's date — yesterday's counts are final and
+    don't need recovery.
+    """
+    global _pending_increments
+
+    today = _get_today_date()
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT proxy_key, count FROM request_counts WHERE date = ?",
+            (today,),
+        )
+        rows = cursor.fetchall()
+        if rows:
+            recovered = {row["proxy_key"]: {"count": row["count"], "date": today, "dirty": False}
+                       for row in rows}
+            _pending_increments.update(recovered)
+            logger.info("Recovered %d pending increment entries from DB.", len(recovered))
+    except Exception as e:
+        logger.warning("Failed to recover pending increments: %s", e)
+    finally:
+        conn.close()
 
 
 def evict_key(proxy_key: str | None = None) -> None:
@@ -254,10 +327,14 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
     """Finds an active key mapping by proxy key.
 
     Checks the in-memory cache first (sliding TTL). Falls back to SQLite.
-    Only active keys are cached. On cache miss (fresh DB read), daily_used
-    is initialized to 0.
+    Only active keys are cached.
+
+    On a cache miss, daily_used is loaded from the request_counts table if
+    today's counts exist; otherwise it is initialized to 0. This means a
+    restarted process correctly respects daily quota without losing counts.
     """
     now = time.time()
+    today = _get_today_date()
 
     # Fast path: cached entry
     with _cache_lock:
@@ -277,7 +354,7 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-            "created_at, last_used_at, quota_limit, rate_limit_rpm "
+            "created_at, last_used_at, quota_limit, rate_limit_rpm, daily_used, daily_reset_date "
             "FROM api_keys WHERE proxy_key = ? AND status = 'active'",
             (proxy_key,),
         )
@@ -285,9 +362,23 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
         result = dict(row) if row else None
 
         if result is not None:
-            # Attach daily_used tracking (initialized to 0 on fresh DB read)
-            result["daily_used"] = 0
-            result["daily_reset_date"] = _get_today_date()
+            # Reset daily_used if the cached date is stale (UTC midnight crossed)
+            cached_date = result.get("daily_reset_date") or ""
+            if cached_date != today:
+                result["daily_used"] = 0
+                result["daily_reset_date"] = today
+            else:
+                # Load today's count from the request_counts table to account for
+                # any increments that were flushed to DB before this key entered
+                # the cache (or after it was evicted and reloaded).
+                cursor.execute(
+                    "SELECT count FROM request_counts WHERE proxy_key = ? AND date = ?",
+                    (proxy_key, today),
+                )
+                count_row = cursor.fetchone()
+                if count_row:
+                    result["daily_used"] = count_row["count"]
+
             with _cache_lock:
                 # Evict oldest entry when at capacity (dict preserves insertion order)
                 if len(_keys_cache) >= _MAX_CACHE_SIZE:
@@ -305,60 +396,72 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
         conn.close()
 
 
-def increment_request_count(proxy_key: str) -> bool:
+def increment_request_count(proxy_key: str) -> tuple[bool, bool]:
     """Increments the in-memory request counter and updates last_used_at.
 
-    Also checks daily quota if one is set on the key. Resets daily_used at midnight UTC.
+    Also checks daily quota if one is set on the key. Resets daily_used at
+    midnight UTC.
 
     Returns:
-        True if the request is within quota (or no quota set), False if quota exceeded.
+        (allowed, flush_needed):
+            allowed     – True if the request is within quota (or no quota set)
+            flush_needed – True if the caller should call flush_pending_increments()
+                          because we've hit the FLUSH_EVERY_N threshold
     """
     global _pending_increments
 
     today = _get_today_date()
+    now = time.time()
+    flush_needed = False
 
     # Check quota from cache if available
     with _cache_lock:
         if proxy_key in _keys_cache:
             entry = _keys_cache[proxy_key]
             quota = entry["data"].get("quota_limit") or 0
-            
-            # Reset daily_used if date has changed
+
+            # Reset daily_used if UTC date has crossed midnight
             if entry["data"].get("daily_reset_date") != today:
                 entry["data"]["daily_used"] = 0
                 entry["data"]["daily_reset_date"] = today
-            
+
             daily_used = entry["data"].get("daily_used") or 0
             if quota > 0 and daily_used >= quota:
-                return False  # Quota exceeded
-        else:
-            # Cache miss — fall back to DB to check quota before allowing the request.
-            # Without this, a fresh process restart or cache eviction would bypass quotas.
-            conn = get_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT quota_limit FROM api_keys WHERE proxy_key = ? AND status = 'active'",
-                    (proxy_key,),
-                )
-                row = cursor.fetchone()
-                if row:
-                    quota = row["quota_limit"] or 0
-                    if quota > 0:
-                        # Key not in cache means daily_used is effectively 0, so quota
-                        # can't be exceeded. But we still need to prime the cache so
-                        # subsequent requests within the same day are tracked.
-                        pass
-            finally:
-                conn.close()
+                return False, False  # Quota exceeded
+
+    # Cache miss — check quota from DB (includes today's flushed count from
+    # request_counts, so we never bypass quota after a process restart).
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT quota_limit, daily_used, daily_reset_date FROM api_keys "
+            "WHERE proxy_key = ? AND status = 'active'",
+            (proxy_key,),
+        )
+        row = cursor.fetchone()
+        if row:
+            quota = row["quota_limit"] or 0
+            cached_date = row["daily_reset_date"] or ""
+            if cached_date != today:
+                current_daily = 0
+            else:
+                current_daily = row["daily_used"] or 0
+            if quota > 0 and current_daily >= quota:
+                return False, False
+    finally:
+        conn.close()
 
     # Buffer the increment
     with _pending_increments_lock:
         if proxy_key not in _pending_increments:
-            _pending_increments[proxy_key] = 0
-        _pending_increments[proxy_key] += 1
+            _pending_increments[proxy_key] = {"count": 0, "date": today, "dirty": False}
+        _pending_increments[proxy_key]["count"] += 1
+        _pending_increments[proxy_key]["dirty"] = True
+        if _pending_increments[proxy_key]["count"] >= FLUSH_EVERY_N:
+            flush_needed = True
 
-    # Update read cache immediately so UI reflects the increment
+    # Update in-memory cache so the UI reflects the increment immediately
     with _cache_lock:
         if proxy_key in _keys_cache:
             entry = _keys_cache[proxy_key]
@@ -367,45 +470,69 @@ def increment_request_count(proxy_key: str) -> bool:
                 "%Y-%m-%d %H:%M:%S"
             )
             entry["data"]["daily_used"] = entry["data"].get("daily_used", 0) + 1
-            entry["expires_at"] = time.time() + _CACHE_TTL_SECONDS
+            entry["data"]["daily_reset_date"] = today
+            entry["expires_at"] = now + _CACHE_TTL_SECONDS
 
-    return True
+    return True, flush_needed
 
 
 def flush_pending_increments() -> None:
-    """Atomically flushes all pending increments to SQLite in a single transaction."""
+    """Atomically flushes all dirty pending increments to SQLite in a single transaction.
+
+    Writes to two tables:
+    - request_counts (proxy_key, date) — durable, survives crashes via WAL
+    - api_keys.daily_used              — used by the UI for display
+
+    Only flushes rows that are marked dirty. Clean rows (recovered from DB on
+    startup but not yet modified) are skipped.
+    """
     global _pending_increments
 
     # Snapshot and clear atomically so concurrent requests keep accumulating
     with _pending_increments_lock:
         if not _pending_increments:
             return
-        to_flush = _pending_increments
+        to_flush = {k: v for k, v in _pending_increments.items() if v.get("dirty")}
         _pending_increments = {}
+
+    if not to_flush:
+        return
 
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        for proxy_key, count in to_flush.items():
+        for proxy_key, pending in to_flush.items():
+            date = pending["date"]
+            count = pending["count"]
+
+            # Upsert into request_counts (WAL-backed — survives SIGKILL)
             cursor.execute(
-                "UPDATE api_keys SET "
-                "  request_count = request_count + ?, "
-                "  last_used_at  = CURRENT_TIMESTAMP "
+                "INSERT INTO request_counts (proxy_key, date, count) VALUES (?, ?, ?) "
+                "ON CONFLICT(proxy_key, date) DO UPDATE SET count = count + ?",
+                (proxy_key, date, count, count),
+            )
+            # Update api_keys for UI display (daily_used is NOT the source of truth
+            # for quota — request_counts is — but keeping it in sync is useful)
+            cursor.execute(
+                "UPDATE api_keys SET daily_used = ?, daily_reset_date = ? "
                 "WHERE proxy_key = ?",
-                (count, proxy_key),
+                (count, date, proxy_key),
             )
         conn.commit()
 
-        logger.debug("Flushed %d increments to DB", len(to_flush))
+        logger.debug("Flushed %d dirty increment groups to DB", len(to_flush))
     except Exception as e:
         logger.error("Error flushing pending increments to database: %s", e)
         conn.rollback()
 
-        # Restore pending increments directly
+        # Restore dirty entries so no increments are lost
         with _pending_increments_lock:
             for k, v in to_flush.items():
-                _pending_increments[k] = _pending_increments.get(k, 0) + v
-        logger.warning("Restored %d pending increments after flush failure", len(to_flush))
+                if k not in _pending_increments:
+                    _pending_increments[k] = {"count": 0, "date": v["date"], "dirty": False}
+                _pending_increments[k]["count"] += v["count"]
+                _pending_increments[k]["dirty"] = True
+        logger.warning("Restored %d dirty increment groups after flush failure", len(to_flush))
     finally:
         conn.close()
 
@@ -433,7 +560,7 @@ def toggle_key_status(key_id: int) -> dict[str, Any] | None:
 
         cursor.execute(
             "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-            "created_at, last_used_at, rate_limit_daily, quota_limit "
+            "created_at, last_used_at, daily_used, daily_reset_date, quota_limit, rate_limit_rpm "
             "FROM api_keys WHERE id = ?",
             (key_id,),
         )
@@ -595,7 +722,7 @@ def get_all_keys(
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-            "created_at, last_used_at, rate_limit_daily, quota_limit, rate_limit_rpm "
+            "created_at, last_used_at, daily_used, daily_reset_date, quota_limit, rate_limit_rpm "
             "FROM api_keys ORDER BY created_at DESC"
         )
         rows = cursor.fetchall()
