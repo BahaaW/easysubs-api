@@ -772,6 +772,7 @@ async def proxy_request(request: Request, path: str) -> Response:
                             "request_id=%s model alias: %s → %s",
                             request_id, original_model, resolved,
                         )
+                data = inject_system_reminder(data, is_anthropic=is_anthropic_client)
                 data = clean_tool_history_if_needed(data)
                 body = json.dumps(data).encode("utf-8")
         except Exception as e:
@@ -923,19 +924,67 @@ def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
     return converted
 
 
+def inject_system_reminder(data: dict, is_anthropic: bool = False) -> dict:
+    """Injects a system reminder about using available tools instead of raw markdown text."""
+    reminder = (
+        "(System Reminder: You MUST use your available tools to create, write, edit files or run commands. "
+        "Do not write full file contents or diffs in markdown blocks in your chat response. Use the tools.)"
+    )
+
+    # 1. Anthropic format (system is a top-level parameter)
+    if is_anthropic or "system" in data:
+        system = data.get("system")
+        if system is None:
+            data["system"] = reminder
+        elif isinstance(system, str):
+            data["system"] = system + "\n\n" + reminder
+        elif isinstance(system, list):
+            system.append({"type": "text", "text": reminder})
+            data["system"] = system
+            
+    # 2. OpenAI format (system is a role inside messages list)
+    else:
+        messages = data.get("messages")
+        if isinstance(messages, list) and messages:
+            first_msg = messages[0]
+            if isinstance(first_msg, dict) and first_msg.get("role") == "system":
+                content = first_msg.get("content") or ""
+                if isinstance(content, str):
+                    first_msg["content"] = content + "\n\n" + reminder
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": reminder})
+                    first_msg["content"] = content
+            else:
+                messages.insert(0, {"role": "system", "content": reminder})
+
+    return data
+
+
 def clean_tool_history_if_needed(data: dict) -> dict:
-    """Strips tools and translates past tool calls/results to text if thinking model or toolless request."""
+    """Cleans request payloads for thinking models and toolless requests to prevent Bedrock 400 errors."""
     model = data.get("model", "")
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
-    # Do not strip tools/tool_choice for thinking models, allowing them to execute tools if upstream supports it.
-    # if is_thinking:
-    #     data.pop("tools", None)
-    #     data.pop("tool_choice", None)
+    # Bedrock Converse API does not support forced tool choice (any/required/tool/function) with thinking.
+    # If thinking is enabled, rewrite forced tool choices to "auto".
+    if is_thinking and "tool_choice" in data:
+        tc = data["tool_choice"]
+        if isinstance(tc, dict):
+            # Anthropic: type is "any" or "tool". OpenAI: type is "function".
+            if tc.get("type") in ("any", "tool", "function"):
+                if tc.get("type") == "function":
+                    data["tool_choice"] = "auto"
+                else:
+                    data["tool_choice"] = {"type": "auto"}
+        else:
+            # OpenAI format / string: "required" or "any"
+            if tc in ("required", "any"):
+                data["tool_choice"] = "auto"
 
-    # Convert tool blocks in history if it's a thinking model OR if tools are absent/empty
-    if is_thinking or not has_tools:
+    # Convert tool blocks in history to text ONLY if the current request has no tools.
+    # If the request HAS tools, Bedrock Converse requires toolUse/toolResult blocks to remain structured.
+    if not has_tools:
         if "messages" in data and isinstance(data["messages"], list):
             data["messages"] = _convert_tool_blocks_to_text(data["messages"])
     
@@ -1289,10 +1338,11 @@ class ToolCallIndexMapper:
 
 
 def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
-    """Updates tool call indices inside choice deltas using the mapper."""
+    """Updates tool call indices inside choice deltas or Anthropic content blocks using the mapper."""
     if not isinstance(chunk, dict):
         return chunk
 
+    # OpenAI format
     if "choices" in chunk and isinstance(chunk["choices"], list):
         for choice in chunk["choices"]:
             if "delta" in choice and isinstance(choice["delta"], dict):
@@ -1304,6 +1354,22 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
                             has_id = "id" in tc and tc["id"] is not None
                             tool_call_id = tc.get("id")
                             tc["index"] = mapper.map_index(incoming, has_id, tool_call_id)
+                            
+    # Anthropic format
+    elif "type" in chunk and isinstance(chunk["type"], str):
+        c_type = chunk["type"]
+        if c_type.startswith("content_block_") and "index" in chunk:
+            incoming = chunk["index"]
+            has_id = False
+            tool_call_id = None
+            if c_type == "content_block_start" and isinstance(chunk.get("content_block"), dict):
+                block = chunk["content_block"]
+                if block.get("type") == "tool_use":
+                    has_id = True
+                    tool_call_id = block.get("id")
+            
+            chunk["index"] = mapper.map_index(incoming, has_id, tool_call_id)
+
     return chunk
 
 
