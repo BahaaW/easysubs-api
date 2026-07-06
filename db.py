@@ -241,16 +241,16 @@ def generate_proxy_key() -> str:
 
 
 def _recover_dirty_increments() -> None:
-    """Recovers pending increments from the request_counts table on startup.
+    """Loads today's counts from request_counts as baseline on startup.
 
-    On a clean shutdown, flush_pending_increments checkpoints all dirty rows
-    before the process exits. On a crash, WAL recovery restores the last
-    committed state from the WAL file. Either way, we reload so that in-flight
-    counts aren't double-counted (we use INSERT OR REPLACE so the DB row is the
-    source of truth, not the in-memory dict).
+    These baseline counts are already in the DB. _pending_increments only
+    tracks NEW increments since the last flush. On flush, the pending count
+    is ADDED to the DB (INSERT ... ON CONFLICT DO UPDATE SET count = count + ?),
+    so we must NOT include the baseline in _pending_increments — otherwise
+    the baseline gets double-counted.
 
-    Only loads entries for today's date — yesterday's counts are final and
-    don't need recovery.
+    Instead, we store the baseline separately so increment_request_count can
+    use it for quota checks without a DB round-trip.
     """
     global _pending_increments
 
@@ -264,10 +264,12 @@ def _recover_dirty_increments() -> None:
         )
         rows = cursor.fetchall()
         if rows:
-            recovered = {row["proxy_key"]: {"count": row["count"], "date": today, "dirty": False}
+            # Store as dirty=False with count=0 — the baseline is in the DB.
+            # increment_request_count will add new increments on top.
+            recovered = {row["proxy_key"]: {"count": 0, "date": today, "dirty": False}
                        for row in rows}
             _pending_increments.update(recovered)
-            logger.info("Recovered %d pending increment entries from DB.", len(recovered))
+            logger.info("Recovered %d baseline entries from DB.", len(recovered))
     except Exception as e:
         logger.warning("Failed to recover pending increments: %s", e)
     finally:
@@ -488,12 +490,18 @@ def flush_pending_increments() -> None:
     """
     global _pending_increments
 
-    # Snapshot and clear atomically so concurrent requests keep accumulating
+    # Snapshot dirty entries and reset their counts (but keep the keys so
+    # non-dirty entries recovered from DB on startup aren't lost).
     with _pending_increments_lock:
         if not _pending_increments:
             return
-        to_flush = {k: v for k, v in _pending_increments.items() if v.get("dirty")}
-        _pending_increments = {}
+        to_flush = {}
+        for k, v in _pending_increments.items():
+            if v.get("dirty"):
+                to_flush[k] = dict(v)
+                # Reset count but keep the entry (preserves date, clears dirty)
+                v["count"] = 0
+                v["dirty"] = False
 
     if not to_flush:
         return
@@ -511,12 +519,17 @@ def flush_pending_increments() -> None:
                 "ON CONFLICT(proxy_key, date) DO UPDATE SET count = count + ?",
                 (proxy_key, date, count, count),
             )
-            # Update api_keys for UI display (daily_used is NOT the source of truth
-            # for quota — request_counts is — but keeping it in sync is useful)
+            # Update api_keys for UI display. Read back the cumulative totals
+            # from request_counts so daily_used and request_count reflect ALL
+            # increments, not just the current batch.
             cursor.execute(
-                "UPDATE api_keys SET daily_used = ?, daily_reset_date = ? "
+                "UPDATE api_keys SET "
+                "daily_used = (SELECT count FROM request_counts WHERE proxy_key = ? AND date = ?), "
+                "request_count = (SELECT COALESCE(SUM(count), 0) FROM request_counts WHERE proxy_key = ?), "
+                "daily_reset_date = ?, "
+                "last_used_at = CURRENT_TIMESTAMP "
                 "WHERE proxy_key = ?",
-                (count, date, proxy_key),
+                (proxy_key, date, proxy_key, date, proxy_key),
             )
         conn.commit()
 

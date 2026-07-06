@@ -781,6 +781,15 @@ async def proxy_request(request: Request, path: str) -> Response:
                 data = inject_system_reminder(data, is_anthropic=is_anthropic_client)
                 data = clean_tool_history_if_needed(data)
                 body = json.dumps(data).encode("utf-8")
+                logger.info(
+                    "request_id=%s model=%s stream=%s tools=%s thinking=%s anthropic=%s",
+                    request_id,
+                    data.get("model", "?"),
+                    data.get("stream", False),
+                    bool(data.get("tools")),
+                    "thinking" in str(data.get("model", "")).lower(),
+                    is_anthropic_client,
+                )
         except Exception as e:
             logger.warning("Failed to process request body: %s", e)
 
@@ -977,16 +986,31 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
-    # Bedrock Converse API does not support tools at all with thinking models.
-    # If a thinking-model request carries tools/tool blocks, strip tools and
-    # convert the history to plain text so Bedrock doesn't see toolUse/toolResult
-    # blocks without a toolConfig.
-    if is_thinking and has_tools:
-        data.pop("tools", None)
-        data.pop("tool_choice", None)
-        if "messages" in data and isinstance(data["messages"], list):
-            data["messages"] = _convert_tool_blocks_to_text(data["messages"])
-        return data
+    # Detect whether the message history contains any tool blocks (tool_use,
+    # tool_result, or tool_calls). Bedrock requires toolConfig when these are
+    # present, even if the current request has no tools array.
+    _has_tool_blocks_in_history = False
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            # OpenAI: tool_calls in assistant message or role=tool
+            if msg.get("role") == "tool":
+                _has_tool_blocks_in_history = True
+                break
+            if "tool_calls" in msg and msg["tool_calls"]:
+                _has_tool_blocks_in_history = True
+                break
+            # Anthropic: tool_use or tool_result in content list
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+                        _has_tool_blocks_in_history = True
+                        break
+                if _has_tool_blocks_in_history:
+                    break
 
     # Bedrock Converse API does not support *generic* forced tool choice
     # (any/required/function — i.e. "call some tool") with thinking models.
@@ -1015,11 +1039,14 @@ def clean_tool_history_if_needed(data: dict) -> dict:
             if tc in ("required", "any"):
                 data["tool_choice"] = "auto"
 
-    # Convert tool blocks in history to text ONLY if the current request has no tools.
-    # If the request HAS tools, Bedrock Converse requires toolUse/toolResult blocks to remain structured.
-    if not has_tools:
-        if "messages" in data and isinstance(data["messages"], list):
-            data["messages"] = _convert_tool_blocks_to_text(data["messages"])
+    # Convert tool blocks in history to text when:
+    # 1. The current request has no tools array, OR
+    # 2. The history has tool blocks but no tools are defined (Bedrock 400 prevention).
+    # If the request HAS tools, Bedrock Converse requires toolUse/toolResult blocks
+    # to remain structured — do NOT convert in that case.
+    if not has_tools and _has_tool_blocks_in_history:
+        if isinstance(messages, list):
+            data["messages"] = _convert_tool_blocks_to_text(messages)
 
     return data
 
