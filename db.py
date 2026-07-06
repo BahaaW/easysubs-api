@@ -158,7 +158,7 @@ def init_db() -> None:
         # ---- Migrate expires_at if missing from sessions ----
         try:
             cursor.execute(
-                "ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                "ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"
             )
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
