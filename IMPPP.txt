@@ -1,3 +1,4 @@
+{
 "models": {
         "claude-haiku-4-5-20251001": { "name": "Haiku 4.5" },
         "claude-opus-4-6": { "name": "Opus 4.6" },
@@ -12,3 +13,4 @@
         "gemini-3.1-pro": { "name": "Gemini 3.1 Pro" },
         "gemini-3.1-pro-low": { "name": "Gemini 3.1 Pro Low" }
 }
+}

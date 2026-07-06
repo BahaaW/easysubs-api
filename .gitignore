@@ -11,3 +11,4 @@ venv/
 ENV/
 env/
 graphify-out/
+scratch/test_proxy.py
