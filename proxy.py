@@ -929,10 +929,10 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
-    # If it's a thinking model, strip tools and tool_choice completely
-    if is_thinking:
-        data.pop("tools", None)
-        data.pop("tool_choice", None)
+    # Do not strip tools/tool_choice for thinking models, allowing them to execute tools if upstream supports it.
+    # if is_thinking:
+    #     data.pop("tools", None)
+    #     data.pop("tool_choice", None)
 
     # Convert tool blocks in history if it's a thinking model OR if tools are absent/empty
     if is_thinking or not has_tools:
