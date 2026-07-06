@@ -669,6 +669,18 @@
 
     <script>
         let cachedKeys = [];
+        let csrfToken = '';
+
+        // Fetch CSRF token on page load
+        async function fetchCsrfToken() {
+            try {
+                const resp = await fetch('/api/admin/csrf-token');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    csrfToken = data.token;
+                }
+            } catch (e) { /* non-fatal */ }
+        }
 
         // Toast notifications helper
         function showToast(message, type = 'success') {
@@ -806,7 +818,8 @@
                 const response = await fetch('/api/admin/keys', {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'X-CSRF-Token': csrfToken
                     },
                     body: JSON.stringify({
                         label: labelInput.value,
@@ -850,7 +863,8 @@
         async function toggleKey(id) {
             try {
                 const response = await fetch(`/api/admin/keys/${id}/toggle`, {
-                    method: 'POST'
+                    method: 'POST',
+                    headers: { 'X-CSRF-Token': csrfToken }
                 });
                 
                 if (response.status === 401) {
@@ -881,7 +895,8 @@
 
             try {
                 const response = await fetch(`/api/admin/keys/${id}`, {
-                    method: 'DELETE'
+                    method: 'DELETE',
+                    headers: { 'X-CSRF-Token': csrfToken }
                 });
 
                 if (response.status === 401) {
@@ -904,7 +919,7 @@
         // Logout
         async function handleLogout() {
             try {
-                await fetch('/api/admin/logout', { method: 'POST' });
+                await fetch('/api/admin/logout', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
                 window.location.href = '/login';
             } catch (err) {
                 window.location.href = '/login';
@@ -960,7 +975,10 @@
         });
 
         // Initial load
-        window.addEventListener('DOMContentLoaded', fetchKeys);
+        window.addEventListener('DOMContentLoaded', async () => {
+            await fetchCsrfToken();
+            fetchKeys();
+        });
     </script>
 </body>
 </html>

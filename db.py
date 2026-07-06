@@ -7,6 +7,7 @@ Handles:
 - Request count aggregation with atomic batch flush
 - WAL-backed crash-resilient pending increments (survives SIGKILL)
 - In-memory cache with TTL + LRU eviction for hot-path optimization
+- Quarterly key encryption at rest via Fernet (FERNET_KEY env var)
 
 All DB operations use thread-safe SQLite connections. The in-memory cache
 is process-global and shared across async tasks — access is serialized via
@@ -23,6 +24,48 @@ from typing import Any
 import logging
 
 logger = logging.getLogger("EasySubsAPI.DB")
+
+# ---------------------------------------------------------------------------
+# Quarterly key encryption at rest
+# ---------------------------------------------------------------------------
+# Uses Fernet (AES-128-CBC + HMAC-SHA256) from the cryptography library.
+# If FERNET_KEY is not set, encryption is a no-op (plaintext storage).
+# Generate a key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# ---------------------------------------------------------------------------
+_fernet = None
+_fernet_key = os.environ.get("FERNET_KEY")
+if _fernet_key:
+    try:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(_fernet_key.encode())
+        # Validate the key immediately
+        _fernet.encrypt(b"validation")
+        logger.info("Quarterly key encryption enabled (Fernet).")
+    except Exception as e:
+        logger.error("FERNET_KEY is set but invalid: %s. Keys will be stored in plaintext.", e)
+        _fernet = None
+else:
+    logger.warning("FERNET_KEY not set. Quarterly keys will be stored in plaintext.")
+
+
+def _encrypt_quarterly_key(plaintext: str) -> str:
+    """Encrypts a quarterly key for storage. Returns plaintext if encryption is disabled."""
+    if _fernet is None:
+        return plaintext
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+
+def _decrypt_quarterly_key(ciphertext: str) -> str:
+    """Decrypts a quarterly key from storage. Returns ciphertext as-is if encryption is disabled."""
+    if _fernet is None:
+        return ciphertext
+    try:
+        return _fernet.decrypt(ciphertext.encode()).decode()
+    except Exception:
+        # If decryption fails (e.g., key rotation, corrupted data), return as-is
+        # so the proxy can still attempt the request (it'll fail with auth error).
+        logger.warning("Failed to decrypt quarterly key — returning raw value.")
+        return ciphertext
 
 # ---------------------------------------------------------------------------
 # Cache configuration
@@ -290,14 +333,18 @@ _evict_key = evict_key
 
 
 def add_api_key(label: str, quarterly_key: str) -> dict[str, Any]:
-    """Creates a new proxy API key mapped to a Quarterly key."""
+    """Creates a new proxy API key mapped to a Quarterly key.
+
+    The quarterly_key is encrypted at rest if FERNET_KEY is configured.
+    """
     conn = get_connection()
     try:
         cursor = conn.cursor()
         proxy_key = generate_proxy_key()
+        encrypted = _encrypt_quarterly_key(quarterly_key.strip())
         cursor.execute(
             "INSERT INTO api_keys (label, proxy_key, quarterly_key) VALUES (?, ?, ?)",
-            (label.strip(), proxy_key, quarterly_key.strip()),
+            (label.strip(), proxy_key, encrypted),
         )
         conn.commit()
 
@@ -307,7 +354,11 @@ def add_api_key(label: str, quarterly_key: str) -> dict[str, Any]:
             (proxy_key,),
         )
         row = cursor.fetchone()
-        return dict(row) if row else {}
+        result = dict(row) if row else {}
+        # Return the plaintext key in the response (one-time reveal)
+        if result:
+            result["quarterly_key"] = quarterly_key.strip()
+        return result
     except Exception as e:
         logger.error("Error adding API key: %s", e)
         conn.rollback()
@@ -364,6 +415,9 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
         result = dict(row) if row else None
 
         if result is not None:
+            # Decrypt quarterly key before returning to proxy
+            result["quarterly_key"] = _decrypt_quarterly_key(result.get("quarterly_key", ""))
+
             # Reset daily_used if the cached date is stale (UTC midnight crossed)
             cached_date = result.get("daily_reset_date") or ""
             if cached_date != today:
@@ -578,7 +632,10 @@ def toggle_key_status(key_id: int) -> dict[str, Any] | None:
             (key_id,),
         )
         updated = cursor.fetchone()
-        return dict(updated) if updated else None
+        result = dict(updated) if updated else None
+        if result:
+            result["quarterly_key"] = _decrypt_quarterly_key(result.get("quarterly_key", ""))
+        return result
     except Exception as e:
         logger.error("Error toggling status for key %d: %s", key_id, e)
         conn.rollback()
@@ -743,7 +800,7 @@ def get_all_keys(
         for row in rows:
             k = dict(row)
             if mask_quarterly_key:
-                k["quarterly_key"] = mask_key(k.get("quarterly_key"))
+                k["quarterly_key"] = mask_key(_decrypt_quarterly_key(k.get("quarterly_key", "")))
             keys.append(k)
         return keys
     except Exception as e:

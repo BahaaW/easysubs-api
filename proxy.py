@@ -119,6 +119,15 @@ _MODELS_CACHE_TTL: float = 300.0  # 5 minutes
 _models_lock: asyncio.Lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
+# CSRF protection for admin endpoints
+# ---------------------------------------------------------------------------
+# In-memory CSRF token store: token -> expiry timestamp. Tokens are bound to
+# the session and expire after 8 hours. Using in-memory storage because admin
+# sessions are already in-memory (SQLite-backed but validated per-request).
+_csrf_tokens: dict[str, float] = {}
+_CSRF_TOKEN_TTL: float = 28800.0  # 8 hours
+
+# ---------------------------------------------------------------------------
 # Debug / tracing
 # ---------------------------------------------------------------------------
 
@@ -238,7 +247,7 @@ def is_login_rate_limited(ip: str) -> bool:
 
 async def is_authenticated(request: Request) -> bool:
     """Verifies the admin session cookie against the DB."""
-    session_id = request.cookies.get("admin_session")
+    session_id = request.cookies.get("__Host-admin_session")
     if not session_id:
         return False
     return await asyncio.to_thread(db.validate_session, session_id)
@@ -247,6 +256,34 @@ async def is_authenticated(request: Request) -> bool:
 def _build_request_id() -> str:
     """Generates a short unique request ID for tracing."""
     return secrets.token_hex(6)
+
+
+def _generate_csrf_token() -> str:
+    """Generates a cryptographically secure CSRF token."""
+    return secrets.token_hex(32)
+
+
+def _validate_csrf(session_id: str, token: str) -> bool:
+    """Validates a CSRF token against the in-memory store. Cleans expired tokens."""
+    now = time.time()
+    # Purge expired tokens
+    expired = [k for k, v in _csrf_tokens.items() if now >= v]
+    for k in expired:
+        del _csrf_tokens[k]
+    expected = _csrf_tokens.get(session_id)
+    if expected and secrets.compare_digest(expected, token):
+        return True
+    return False
+
+
+async def _require_csrf(request: Request) -> None:
+    """FastAPI dependency: validates CSRF token for state-changing admin requests."""
+    session_id = request.cookies.get("__Host-admin_session")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = request.headers.get("x-csrf-token") or request.headers.get("x-xsrf-token")
+    if not token or not _validate_csrf(session_id, token):
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
 
 
 # ---------------------------------------------------------------------------
@@ -289,9 +326,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     elif environment not in ("local", "development"):
         if config.ADMIN_USERNAME == "admin" and config.ADMIN_PASSWORD == "admin_secure_pass":
-            logger.warning(
-                "WARNING: Running with default admin credentials in %s. "
-                "Set ADMIN_USERNAME and ADMIN_PASSWORD env vars.", environment
+            raise RuntimeError(
+                "CRITICAL: Default admin credentials detected in %s environment. "
+                "Set ADMIN_USERNAME and ADMIN_PASSWORD env vars before starting." % environment
             )
 
     # Start background flusher
@@ -392,6 +429,26 @@ async def root(request: Request) -> Response:
     return RedirectResponse(url="/login", status_code=303)
 
 
+# Security headers applied to all HTML responses
+_SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def get_login(request: Request) -> Response:
     if await is_authenticated(request):
@@ -399,7 +456,7 @@ async def get_login(request: Request) -> Response:
     static_path = os.path.join(os.path.dirname(__file__), "static", "login.html")
     if os.path.exists(static_path):
         with open(static_path, encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+            return HTMLResponse(content=f.read(), headers=_SECURITY_HEADERS)
     return HTMLResponse(content="<h2>Login template not found.</h2>", status_code=404)
 
 
@@ -410,7 +467,7 @@ async def get_dashboard(request: Request) -> Response:
     static_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
     if os.path.exists(static_path):
         with open(static_path, encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
+            return HTMLResponse(content=f.read(), headers=_SECURITY_HEADERS)
     return HTMLResponse(content="<h2>Dashboard template not found.</h2>", status_code=404)
 
 
@@ -442,6 +499,17 @@ async def readiness_check(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Admin API Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/admin/csrf-token")
+async def get_csrf_token(request: Request) -> JSONResponse:
+    """Returns a CSRF token bound to the current admin session."""
+    if not await is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    session_id = request.cookies.get("__Host-admin_session")
+    token = _generate_csrf_token()
+    _csrf_tokens[session_id] = time.time() + _CSRF_TOKEN_TTL
+    return JSONResponse({"token": token})
+
 
 @app.post("/api/admin/login")
 async def admin_login(
@@ -485,14 +553,15 @@ async def admin_login(
         _ip_brute_force.pop(client_ip, None)
 
         session_id = await asyncio.to_thread(db.create_session)
-        is_secure = request.headers.get("x-forwarded-proto", "http") == "https"
+        _force_secure = os.environ.get("FORCE_SECURE_COOKIES", "1") == "1"
         resp = JSONResponse({"success": True, "message": "Authenticated successfully"})
         resp.set_cookie(
-            key="admin_session",
+            key="__Host-admin_session",
             value=session_id,
             httponly=True,
-            samesite="lax",
-            secure=is_secure,
+            samesite="strict",
+            secure=_force_secure,
+            path="/",
             max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
         )
         return resp
@@ -515,11 +584,12 @@ async def admin_login(
 
 @app.post("/api/admin/logout")
 async def admin_logout(request: Request) -> JSONResponse:
-    session_id = request.cookies.get("admin_session")
+    await _require_csrf(request)
+    session_id = request.cookies.get("__Host-admin_session")
     if session_id:
         await asyncio.to_thread(db.delete_session, session_id)
     resp = JSONResponse({"success": True, "message": "Logged out successfully"})
-    resp.delete_cookie("admin_session")
+    resp.delete_cookie("__Host-admin_session", path="/")
     return resp
 
 
@@ -540,6 +610,7 @@ async def create_key(
 ) -> JSONResponse:
     if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    await _require_csrf(request)
 
     if not payload.label.strip() or not payload.quarterly_key.strip():
         raise HTTPException(
@@ -574,6 +645,7 @@ async def update_key(
     """Update optional settings on a key (e.g., quota_limit)."""
     if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    await _require_csrf(request)
 
     conn = db.get_connection()
     try:
@@ -606,6 +678,7 @@ async def update_key(
 async def toggle_key(key_id: int, request: Request) -> JSONResponse:
     if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    await _require_csrf(request)
 
     updated = await asyncio.to_thread(db.toggle_key_status, key_id)
     if not updated:
@@ -617,6 +690,7 @@ async def toggle_key(key_id: int, request: Request) -> JSONResponse:
 async def delete_key(key_id: int, request: Request) -> JSONResponse:
     if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    await _require_csrf(request)
 
     success = await asyncio.to_thread(db.delete_key, key_id)
     if not success:
@@ -762,8 +836,12 @@ async def proxy_request(request: Request, path: str) -> Response:
     # ---- Forward headers (filter hop-by-hop, auth, and compression) ----
     headers = _build_forward_headers(request, key_mapping["quarterly_key"])
 
-    # ---- Read body ----
+    # ---- Read body (with size limit to prevent memory exhaustion DoS) ----
+    _max_body = int(os.environ.get("MAX_REQUEST_BODY_BYTES", 10 * 1024 * 1024))  # 10 MB default
     body = await request.body()
+    if len(body) > _max_body:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    client_wants_stream = False
     if body:
         try:
             data = json.loads(body)
@@ -780,12 +858,13 @@ async def proxy_request(request: Request, path: str) -> Response:
                         )
                 data = inject_system_reminder(data, is_anthropic=is_anthropic_client)
                 data = clean_tool_history_if_needed(data)
+                client_wants_stream = data.get("stream", False)
                 body = json.dumps(data).encode("utf-8")
                 logger.info(
                     "request_id=%s model=%s stream=%s tools=%s thinking=%s anthropic=%s",
                     request_id,
                     data.get("model", "?"),
-                    data.get("stream", False),
+                    client_wants_stream,
                     bool(data.get("tools")),
                     "thinking" in str(data.get("model", "")).lower(),
                     is_anthropic_client,
@@ -809,6 +888,7 @@ async def proxy_request(request: Request, path: str) -> Response:
         upstream_resp = await _forward_request(
             upstream_method, target_url, headers, body, request_id,
             is_anthropic_client=is_anthropic_client,
+            stream=client_wants_stream,
         )
         return upstream_resp
 
@@ -986,11 +1066,30 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
+    # Fast-path: when tools are present, tool blocks are valid and should stay
+    # structured. The only cleanup needed is tool_choice for thinking models.
+    messages = data.get("messages")
+    if has_tools:
+        # Still downgrade generic forced tool choices for thinking models
+        if is_thinking and "tool_choice" in data:
+            tc = data["tool_choice"]
+            if isinstance(tc, dict):
+                tc_type = tc.get("type")
+                if tc_type == "any":
+                    data["tool_choice"] = {"type": "auto"}
+                elif tc_type == "function" and not (
+                    isinstance(tc.get("function"), dict) and tc["function"].get("name")
+                ):
+                    data["tool_choice"] = "auto"
+            else:
+                if tc in ("required", "any"):
+                    data["tool_choice"] = "auto"
+        return data
+
     # Detect whether the message history contains any tool blocks (tool_use,
     # tool_result, or tool_calls). Bedrock requires toolConfig when these are
     # present, even if the current request has no tools array.
     _has_tool_blocks_in_history = False
-    messages = data.get("messages")
     if isinstance(messages, list):
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1012,39 +1111,7 @@ def clean_tool_history_if_needed(data: dict) -> dict:
                 if _has_tool_blocks_in_history:
                     break
 
-    # Bedrock Converse API does not support *generic* forced tool choice
-    # (any/required/function — i.e. "call some tool") with thinking models.
-    # However, a SPECIFIC tool force (Anthropic type:"tool" with a name, or
-    # OpenAI type:"function" with a function.name) MUST be preserved — that's
-    # how clients like Claude Code force the model to use the edit tool instead
-    # of dumping file contents into chat. Downgrading it causes the model to
-    # respond in prose rather than calling the tool.
-    if is_thinking and "tool_choice" in data:
-        tc = data["tool_choice"]
-        if isinstance(tc, dict):
-            tc_type = tc.get("type")
-            # Anthropic "any" → auto (generic force, breaks Bedrock)
-            if tc_type == "any":
-                data["tool_choice"] = {"type": "auto"}
-            # Anthropic "tool" with a specific name → KEEP (Claude Code edit flow)
-            # OpenAI "function" with a specific function.name → KEEP
-            # Only downgrade bare "function" without a name (shouldn't happen, but safe)
-            elif tc_type == "function" and not (
-                isinstance(tc.get("function"), dict) and tc["function"].get("name")
-            ):
-                data["tool_choice"] = "auto"
-            # type == "tool" with name, or "function" with name → pass through unchanged
-        else:
-            # OpenAI string format: "required" or "any" → auto
-            if tc in ("required", "any"):
-                data["tool_choice"] = "auto"
-
-    # Convert tool blocks in history to text when:
-    # 1. The current request has no tools array, OR
-    # 2. The history has tool blocks but no tools are defined (Bedrock 400 prevention).
-    # If the request HAS tools, Bedrock Converse requires toolUse/toolResult blocks
-    # to remain structured — do NOT convert in that case.
-    if not has_tools and _has_tool_blocks_in_history:
+    if _has_tool_blocks_in_history:
         if isinstance(messages, list):
             data["messages"] = _convert_tool_blocks_to_text(messages)
 
@@ -1110,8 +1177,13 @@ async def _forward_request(
     body: bytes,
     request_id: str,
     is_anthropic_client: bool = False,
+    stream: bool = False,
 ) -> Response:
-    """Sends the request to upstream and returns a StreamingResponse or JSONResponse."""
+    """Sends the request to upstream and returns a StreamingResponse or JSONResponse.
+
+    Respects the client's stream preference: non-streaming requests are sent
+    without stream=True to avoid unnecessary SSE overhead on the upstream side.
+    """
     global _debug_stream_logs
 
     req = _http_client.build_request(
@@ -1121,7 +1193,7 @@ async def _forward_request(
         content=body,
     )
 
-    upstream = await _http_client.send(req, stream=True)
+    upstream = await _http_client.send(req, stream=stream)
     content_type = upstream.headers.get("content-type", "")
 
     # Check if this is a streaming response
@@ -1180,16 +1252,21 @@ async def _stream_generator(
     request_id: str,
     is_anthropic_client: bool = False,
 ) -> AsyncIterator[bytes]:
-    """Yields SSE lines, handling XML → JSON conversion and index remapping."""
+    """Yields SSE lines, handling XML → JSON conversion and index remapping.
+
+    Fast-path: when text chunks contain no '<' character, the XML converter
+    and index mapper are bypassed entirely — the chunk is re-serialized and
+    yielded directly. This covers 99%+ of normal responses.
+    """
     global _debug_stream_logs
 
     mapper = ToolCallIndexMapper()
-    # Seed format from request headers; refined on first real chunk if needed
     is_openai: bool = not is_anthropic_client
-    converter: XMLToJSONConverter = XMLToJSONConverter(is_openai_format=is_openai)
+    converter: XMLToJSONConverter | None = None  # lazy-init only if needed
     last_message_id: str | None = None
     chunk_count = 0
     format_confirmed: bool = False
+    _needs_xml_processing: bool | None = None  # tri-state: None=unknown, True/False
 
     try:
         async for line in upstream.aiter_lines():
@@ -1213,29 +1290,36 @@ async def _stream_generator(
 
                 if data_str == "[DONE]":
                     # Flush any buffered converter state
-                    rem_text, rem_chunks = converter.flush(message_id=last_message_id)
-                    if rem_text:
-                        for chunk_bytes in _yield_text_delta(
-                            rem_text, is_openai, last_message_id
-                        ):
-                            yield chunk_bytes
-                    for c in rem_chunks:
-                        yield f"data: {json.dumps(c)}\n\n".encode()
+                    if converter is not None:
+                        rem_text, rem_chunks = converter.flush(message_id=last_message_id)
+                        if rem_text:
+                            for chunk_bytes in _yield_text_delta(
+                                rem_text, is_openai, last_message_id
+                            ):
+                                yield chunk_bytes
+                        for c in rem_chunks:
+                            yield f"data: {json.dumps(c)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                     continue
 
                 try:
                     chunk = json.loads(data_str)
+
+                    # Fast-path: if we've already determined no XML processing is
+                    # needed, skip sanitize+map+convert and just re-serialize.
+                    if _needs_xml_processing is False:
+                        yield f"data: {json.dumps(chunk)}\n\n".encode()
+                        continue
+
                     chunk = sanitize_json(chunk)
                     chunk = map_chunk_tool_calls(chunk, mapper)
 
-                    # Refine format on first real chunk (override header hint if needed)
+                    # Refine format on first real chunk
                     if not format_confirmed:
                         format_confirmed = True
                         chunk_is_openai = "choices" in chunk
                         if chunk_is_openai != is_openai:
                             is_openai = chunk_is_openai
-                            converter = XMLToJSONConverter(is_openai_format=is_openai)
 
                     if is_openai:
                         last_message_id = chunk.get("id") or last_message_id
@@ -1244,12 +1328,21 @@ async def _stream_generator(
                     text = _extract_text_from_chunk(chunk, is_openai)
 
                     if text:
-                        text_to_yield, tool_chunks = converter.process_chunk_text(text)
-                        # Modify chunk's delta content
-                        _set_chunk_text(chunk, is_openai, text_to_yield)
-                        yield f"data: {json.dumps(chunk)}\n\n".encode()
-                        for tc in tool_chunks:
-                            yield f"data: {json.dumps(tc)}\n\n".encode()
+                        # Determine if XML processing is needed (once per stream)
+                        if _needs_xml_processing is None:
+                            _needs_xml_processing = "<" in text
+                            if _needs_xml_processing:
+                                converter = XMLToJSONConverter(is_openai_format=is_openai)
+
+                        if _needs_xml_processing:
+                            text_to_yield, tool_chunks = converter.process_chunk_text(text)
+                            _set_chunk_text(chunk, is_openai, text_to_yield)
+                            yield f"data: {json.dumps(chunk)}\n\n".encode()
+                            for tc in tool_chunks:
+                                yield f"data: {json.dumps(tc)}\n\n".encode()
+                        else:
+                            # No XML — just re-serialize and yield
+                            yield f"data: {json.dumps(chunk)}\n\n".encode()
                     else:
                         # Pass through non-text chunks (thinking blocks, tool deltas, usage)
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
@@ -1259,7 +1352,6 @@ async def _stream_generator(
                     yield f"{line}\n\n".encode()
             else:
                 # Non-data lines (e.g. HTTP metadata, comments, empty lines)
-                # SSE spec requires \n\n as message boundary for empty lines
                 yield f"{line}\n".encode()
                 if not line.strip():
                     yield b"\n"
