@@ -48,11 +48,50 @@ import config
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL.upper(), logging.WARNING),
-    format="%(asctime)sZ %(levelname)s %(name)s | %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for production environments."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_obj = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        # Add exception info if present
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+
+        # Add extra fields from record
+        for key, value in record.__dict__.items():
+            if key not in ("name", "msg", "args", "created", "filename", "funcName",
+                          "levelname", "levelno", "lineno", "module", "msecs",
+                          "message", "pathname", "process", "processName",
+                          "relativeCreated", "thread", "threadName", "exc_info",
+                          "exc_text", "stack_info"):
+                log_obj[key] = value
+
+        return json.dumps(log_obj)
+
+
+# Use JSON logging in production, human-readable in local
+_use_json_logs = os.environ.get("LOG_FORMAT", "").lower() == "json"
+if _use_json_logs:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONFormatter())
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL.upper(), logging.WARNING),
+        handlers=[handler],
+    )
+else:
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL.upper(), logging.WARNING),
+        format="%(asctime)sZ %(levelname)s %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
 logger = logging.getLogger("EasySubsAPI.Proxy")
 
 # ---------------------------------------------------------------------------
@@ -72,6 +111,14 @@ _ip_brute_force: dict[str, dict[str, Any]] = {}
 
 # Per-key daily quota tracking: proxy_key -> daily_used_count
 _key_daily_usage: dict[str, int] = {}
+
+# Per-key sliding-window rate limit tracking: proxy_key -> request timestamps
+_key_request_history: dict[str, list[float]] = {}
+
+# /v1/models response cache (process-wide TTL cache)
+_models_cache: dict | None = None
+_models_cache_expires: float = 0.0
+_MODELS_CACHE_TTL: float = 300.0  # 5 minutes
 
 # ---------------------------------------------------------------------------
 # Debug / tracing
@@ -151,7 +198,8 @@ def is_rate_limited(
     cleanup_counter_ref[0] += 1
     if cleanup_counter_ref[0] >= cleanup_every:
         cleanup_counter_ref[0] = 0
-        stale = [k for k, v in history.items() if not v or all(t < cutoff for t in v)]
+        stale_cutoff = now - (window * 2)
+        stale = [k for k, v in history.items() if not v or (v and max(v) < stale_cutoff)]
         for k in stale:
             history.pop(k, None)
 
@@ -165,6 +213,25 @@ def is_proxy_rate_limited(ip: str) -> bool:
         config.RATE_LIMIT_REQUESTS,
         config.RATE_LIMIT_WINDOW_SECONDS,
         [_proxy_rate_limit_cleanup_counter],
+    )
+
+
+def is_key_rate_limited(proxy_key: str, rpm_limit: int) -> bool:
+    """Sliding-window rate limiter for a specific proxy key (requests per minute).
+
+    Args:
+        proxy_key: The proxy API key string (used as the tracking key).
+        rpm_limit: Maximum requests per 60-second window. 0 = unlimited.
+    """
+    if rpm_limit <= 0:
+        return False
+    return is_rate_limited(
+        proxy_key,
+        _key_request_history,
+        rpm_limit,
+        60.0,
+        [0],
+        cleanup_every=200,
     )
 
 
@@ -244,11 +311,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # ---- Shutdown ----
+    # Give in-flight requests 30 seconds to complete before forcing shutdown
+    shutdown_timeout = getattr(config, "SHUTDOWN_TIMEOUT_SECONDS", 30.0)
+
+    # Cancel the background flusher first
     _flusher_task.cancel()
     try:
-        await _flusher_task
+        await asyncio.wait_for(_flusher_task, timeout=shutdown_timeout)
     except asyncio.CancelledError:
         pass
+    except asyncio.TimeoutError:
+        logger.warning("Background flusher did not complete within %ss", shutdown_timeout)
 
     # Final flush — drain all pending increments before exit
     db.flush_pending_increments()
@@ -314,6 +387,7 @@ class KeyCreateRequest(BaseModel):
 
 class KeyUpdateRequest(BaseModel):
     quota_limit: int | None = None
+    rate_limit_rpm: int | None = None  # max requests per minute; 0 = unlimited
 
 
 # ---------------------------------------------------------------------------
@@ -354,16 +428,24 @@ async def get_dashboard(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health_check() -> JSONResponse:
+async def health_check(request: Request) -> JSONResponse:
     """Returns 200 if the process is healthy. Used by Railway / k8s probes."""
-    return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+    request_id = request.headers.get("x-request-id") or _build_request_id()
+    return JSONResponse(
+        {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()},
+        headers={"X-Request-ID": request_id},
+    )
 
 
 @app.get("/ready")
-async def readiness_check() -> JSONResponse:
+async def readiness_check(request: Request) -> JSONResponse:
     """Returns 200 if the service can handle requests."""
+    request_id = request.headers.get("x-request-id") or _build_request_id()
     # TODO: could check DB connectivity here
-    return JSONResponse({"status": "ready", "timestamp": datetime.now(timezone.utc).isoformat()})
+    return JSONResponse(
+        {"status": "ready", "timestamp": datetime.now(timezone.utc).isoformat()},
+        headers={"X-Request-ID": request_id},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -510,17 +592,24 @@ async def update_key(
     if not await is_authenticated(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # For now, quota_limit is the only updateable field
-    # Could expand with a full PATCH model
     conn = db.get_connection()
     try:
         cursor = conn.cursor()
+        updates: list[str] = []
+        values: list[Any] = []
         if payload.quota_limit is not None:
+            updates.append("quota_limit = ?")
+            values.append(payload.quota_limit)
+        if payload.rate_limit_rpm is not None:
+            updates.append("rate_limit_rpm = ?")
+            values.append(payload.rate_limit_rpm)
+        if updates:
+            values.append(key_id)
             cursor.execute(
-                "UPDATE api_keys SET quota_limit = ? WHERE id = ?",
-                (payload.quota_limit, key_id),
+                f"UPDATE api_keys SET {', '.join(updates)} WHERE id = ?",
+                values,
             )
-        conn.commit()
+            conn.commit()
         db.evict_key(None)  # clear cache so changes take effect
         return JSONResponse({"success": True})
     except Exception as e:
@@ -568,7 +657,9 @@ async def get_debug_stream(request: Request) -> JSONResponse:
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models(request: Request) -> JSONResponse:
-    """Returns the list of available models. Supports dynamic fetch + static fallback."""
+    """Returns the list of available models. Fetches from upstream with TTL cache."""
+    global _models_cache, _models_cache_expires
+
     client_ip = get_client_ip(request)
     if is_proxy_rate_limited(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded.")
@@ -584,6 +675,11 @@ async def list_models(request: Request) -> JSONResponse:
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
 
+    # Return cached result if still fresh
+    now = time.time()
+    if _models_cache is not None and now < _models_cache_expires:
+        return JSONResponse(_models_cache)
+
     target_url = f"{config.TARGET_SCHEME}://{config.TARGET_HOST}/v1/models"
     headers = {
         "authorization": f"Bearer {key_mapping['quarterly_key']}",
@@ -593,15 +689,16 @@ async def list_models(request: Request) -> JSONResponse:
     try:
         resp = await _http_client.get(target_url, headers=headers, timeout=10.0)
         if resp.status_code == 200:
-            return JSONResponse(resp.json())
+            payload = resp.json()
+            _models_cache = payload
+            _models_cache_expires = now + _MODELS_CACHE_TTL
+            return JSONResponse(payload)
     except Exception as e:
         logger.warning("Failed to fetch models from upstream: %s", e)
 
     # Fallback to IMPPP.txt-derived list
-    return JSONResponse({
-        "object": "list",
-        "data": config.FALLBACK_MODELS,
-    })
+    fallback = {"object": "list", "data": config.FALLBACK_MODELS}
+    return JSONResponse(fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -630,37 +727,54 @@ async def proxy_request(request: Request, path: str) -> Response:
     if not key_mapping:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
 
-    # ---- Per-key daily quota check ----
-    today = _get_today_key()
-    quota = key_mapping.get("quota_limit") or 0
-    if quota > 0:
-        daily_used = key_mapping.get("rate_limit_daily") or 0
-        # The DB tracks this, but we can check locally for speed
-        # The actual increment + quota check happens in increment_request_count
-        if key_mapping.get("rate_limit_daily") and int(str(key_mapping.get("rate_limit_daily") or "0").split("_")[0] if isinstance(key_mapping.get("rate_limit_daily"), str) else key_mapping.get("rate_limit_daily") or 0) >= quota:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Daily quota ({quota}) exceeded for this proxy key.",
-            )
+    # ---- Per-key RPM rate limit check ----
+    rpm_limit = key_mapping.get("rate_limit_rpm") or 0
+    if is_key_rate_limited(proxy_key, rpm_limit):
+        raise HTTPException(status_code=429, detail="Per-key rate limit exceeded.")
 
-    # Increment usage counter (returns False if quota exceeded)
-    within_quota = await asyncio.to_thread(
-        db.increment_request_count, proxy_key
-    )
+    # ---- Per-key daily quota check (delegated to DB layer) ----
+    within_quota = await asyncio.to_thread(db.increment_request_count, proxy_key)
     if not within_quota:
+        quota = key_mapping.get("quota_limit") or 0
         raise HTTPException(
             status_code=429,
             detail=f"Daily quota ({quota}) exceeded for this proxy key.",
         )
 
+    # ---- Normalize path (handle missing /v1/ prefix for some clients) ----
+    _BARE_PATHS = {"chat/completions", "completions", "embeddings", "models"}
+    if not path.startswith("v1/") and path in _BARE_PATHS:
+        path = f"v1/{path}"
+
     # ---- Build target URL ----
     target_url = f"{config.TARGET_SCHEME}://{config.TARGET_HOST}/{path}"
+
+    # ---- Detect client API format from request headers ----
+    is_anthropic_client = bool(request.headers.get("anthropic-version"))
 
     # ---- Forward headers (filter hop-by-hop, auth, and compression) ----
     headers = _build_forward_headers(request, key_mapping["quarterly_key"])
 
     # ---- Read body ----
     body = await request.body()
+    if body:
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                # Translate model alias (client name → Quatarly name)
+                if "model" in data:
+                    original_model = data["model"]
+                    resolved = config.resolve_model_alias(original_model)
+                    if resolved != original_model:
+                        data["model"] = resolved
+                        logger.info(
+                            "request_id=%s model alias: %s → %s",
+                            request_id, original_model, resolved,
+                        )
+                data = clean_tool_history_if_needed(data)
+                body = json.dumps(data).encode("utf-8")
+        except Exception as e:
+            logger.warning("Failed to process request body: %s", e)
 
     # ---- Handle streaming vs non-streaming upstream ----
     upstream_method = request.method
@@ -676,24 +790,156 @@ async def proxy_request(request: Request, path: str) -> Response:
 
     try:
         upstream_resp = await _forward_request(
-            upstream_method, target_url, headers, body, request_id
+            upstream_method, target_url, headers, body, request_id,
+            is_anthropic_client=is_anthropic_client,
         )
         return upstream_resp
 
-    except httpx.HTTPStatusError as e:
-        logger.warning("Upstream %s: %s", e.response.status_code, e)
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"Upstream error: {e.response.text[:500]}",
-        )
     except Exception as e:
         logger.exception("request_id=%s proxy error: %s", request_id, e)
         raise HTTPException(status_code=502, detail=f"Proxy error: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Proxy helper functions
-# ---------------------------------------------------------------------------
+def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
+    """Converts toolUse/toolResult blocks to text for thinking model compat."""
+    converted = []
+    tool_id_to_name = {}
+
+    # First pass: map tool IDs to names
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        # OpenAI style: tool_calls list
+        if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+            for tc in msg["tool_calls"]:
+                if isinstance(tc, dict):
+                    t_id = tc.get("id")
+                    t_name = tc.get("function", {}).get("name", "unknown")
+                    if t_id:
+                        tool_id_to_name[t_id] = t_name
+        # Anthropic style: content list
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    t_id = block.get("id")
+                    t_name = block.get("name", "unknown")
+                    if t_id:
+                        tool_id_to_name[t_id] = t_name
+
+    # Second pass: convert blocks
+    for msg in messages:
+        if not isinstance(msg, dict):
+            converted.append(msg)
+            continue
+
+        new_msg = dict(msg)
+        role = new_msg.get("role")
+
+        # Case A: OpenAI "role": "tool" (tool output)
+        if role == "tool":
+            new_msg["role"] = "user"
+            tool_id = new_msg.get("tool_call_id", "")
+            tool_name = tool_id_to_name.get(tool_id) or new_msg.get("name") or "unknown"
+            raw_content = new_msg.get("content") or ""
+            
+            new_msg["content"] = f"[System: Tool output for '{tool_name}']: {raw_content}"
+            new_msg.pop("tool_call_id", None)
+            new_msg.pop("name", None)
+            converted.append(new_msg)
+            continue
+
+        # Case B: OpenAI assistant message with "tool_calls"
+        if "tool_calls" in new_msg and isinstance(new_msg["tool_calls"], list):
+            tool_calls = new_msg.pop("tool_calls")
+            descriptions = []
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    t_name = tc.get("function", {}).get("name", "unknown")
+                    t_args = tc.get("function", {}).get("arguments", "{}")
+                    descriptions.append(f"[Assistant called tool '{t_name}' with args: {t_args}]")
+            
+            reminder_text = "\n\n".join(descriptions)
+            content = new_msg.get("content")
+            if content is None:
+                new_msg["content"] = reminder_text
+            elif isinstance(content, str):
+                if content.strip():
+                    new_msg["content"] = content + "\n\n" + reminder_text
+                else:
+                    new_msg["content"] = reminder_text
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": reminder_text})
+                new_msg["content"] = content
+            
+            converted.append(new_msg)
+            continue
+
+        # Case C: Anthropic message content list (could contain tool_use or tool_result blocks)
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                if not isinstance(block, dict):
+                    new_content.append(block)
+                    continue
+
+                b_type = block.get("type")
+                if b_type == "tool_use":
+                    t_name = block.get("name", "unknown")
+                    t_args = json.dumps(block.get("input", {}))
+                    new_content.append({
+                        "type": "text",
+                        "text": f"[Assistant called tool '{t_name}' with args: {t_args}]"
+                    })
+                elif b_type == "tool_result":
+                    tool_id = block.get("tool_use_id", "")
+                    tool_name = tool_id_to_name.get(tool_id, "unknown")
+                    
+                    raw_content = block.get("content")
+                    text_content = ""
+                    if isinstance(raw_content, str):
+                        text_content = raw_content
+                    elif isinstance(raw_content, list):
+                        parts = []
+                        for sub_b in raw_content:
+                            if isinstance(sub_b, dict) and sub_b.get("type") == "text":
+                                parts.append(sub_b.get("text", ""))
+                        text_content = "\n".join(parts)
+                    
+                    new_content.append({
+                        "type": "text",
+                        "text": f"[System: Tool output for '{tool_name}']: {text_content}"
+                    })
+                else:
+                    new_content.append(block)
+            
+            new_msg["content"] = new_content
+            
+        converted.append(new_msg)
+
+    return converted
+
+
+def clean_tool_history_if_needed(data: dict) -> dict:
+    """Strips tools and translates past tool calls/results to text if thinking model or toolless request."""
+    model = data.get("model", "")
+    is_thinking = "thinking" in model.lower()
+    has_tools = "tools" in data and bool(data["tools"])
+
+    # If it's a thinking model, strip tools and tool_choice completely
+    if is_thinking:
+        data.pop("tools", None)
+        data.pop("tool_choice", None)
+
+    # Convert tool blocks in history if it's a thinking model OR if tools are absent/empty
+    if is_thinking or not has_tools:
+        if "messages" in data and isinstance(data["messages"], list):
+            data["messages"] = _convert_tool_blocks_to_text(data["messages"])
+    
+    return data
+
 
 def _extract_proxy_key(request: Request) -> str | None:
     """Extracts proxy key from Authorization: Bearer or X-API-Key header."""
@@ -736,6 +982,11 @@ def _build_forward_headers(request: Request, quarterly_key: str) -> dict[str, st
     headers["authorization"] = f"Bearer {quarterly_key}"
     headers["x-api-key"] = quarterly_key
 
+    # For Anthropic /v1/messages endpoint: inject minimum version header if client omitted it
+    if "/messages" in request.url.path:
+        if not any(k.lower() == "anthropic-version" for k in headers):
+            headers["anthropic-version"] = "2023-06-01"
+
     return headers
 
 
@@ -748,6 +999,7 @@ async def _forward_request(
     headers: dict[str, str],
     body: bytes,
     request_id: str,
+    is_anthropic_client: bool = False,
 ) -> Response:
     """Sends the request to upstream and returns a StreamingResponse or JSONResponse."""
     global _debug_stream_logs
@@ -765,7 +1017,7 @@ async def _forward_request(
     # Check if this is a streaming response
     if "text/event-stream" in content_type or "stream" in content_type.lower():
         return StreamingResponse(
-            _stream_generator(upstream, request_id),
+            _stream_generator(upstream, request_id, is_anthropic_client=is_anthropic_client),
             status_code=upstream.status_code,
             media_type="text/event-stream",
             headers={
@@ -779,7 +1031,15 @@ async def _forward_request(
     # Non-streaming: read fully, process, return
     try:
         content = await upstream.aread()
-        await upstream.aclose()
+
+        # Pass non-2xx responses verbatim — clients (e.g. Cursor) need raw error bodies
+        if upstream.status_code >= 400:
+            return Response(
+                content=content,
+                status_code=upstream.status_code,
+                media_type=content_type or "application/json",
+                headers={"X-Request-ID": request_id},
+            )
 
         # Try to parse as JSON for XML → JSON tool call conversion
         try:
@@ -808,15 +1068,18 @@ async def _forward_request(
 async def _stream_generator(
     upstream: httpx.Response,
     request_id: str,
+    is_anthropic_client: bool = False,
 ) -> AsyncIterator[bytes]:
     """Yields SSE lines, handling XML → JSON conversion and index remapping."""
     global _debug_stream_logs
 
     mapper = ToolCallIndexMapper()
-    converter: XMLToJSONConverter | None = None
-    is_openai = True
+    # Seed format from request headers; refined on first real chunk if needed
+    is_openai: bool = not is_anthropic_client
+    converter: XMLToJSONConverter = XMLToJSONConverter(is_openai_format=is_openai)
     last_message_id: str | None = None
     chunk_count = 0
+    format_confirmed: bool = False
 
     try:
         async for line in upstream.aiter_lines():
@@ -840,15 +1103,14 @@ async def _stream_generator(
 
                 if data_str == "[DONE]":
                     # Flush any buffered converter state
-                    if converter:
-                        rem_text, rem_chunks = converter.flush(message_id=last_message_id)
-                        if rem_text:
-                            for chunk_bytes in _yield_text_delta(
-                                rem_text, is_openai, last_message_id
-                            ):
-                                yield chunk_bytes
-                        for c in rem_chunks:
-                            yield f"data: {json.dumps(c)}\n\n".encode()
+                    rem_text, rem_chunks = converter.flush(message_id=last_message_id)
+                    if rem_text:
+                        for chunk_bytes in _yield_text_delta(
+                            rem_text, is_openai, last_message_id
+                        ):
+                            yield chunk_bytes
+                    for c in rem_chunks:
+                        yield f"data: {json.dumps(c)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
                     continue
 
@@ -857,10 +1119,13 @@ async def _stream_generator(
                     chunk = sanitize_json(chunk)
                     chunk = map_chunk_tool_calls(chunk, mapper)
 
-                    # Initialize converter on first chunk
-                    if converter is None:
-                        is_openai = "choices" in chunk
-                        converter = XMLToJSONConverter(is_openai_format=is_openai)
+                    # Refine format on first real chunk (override header hint if needed)
+                    if not format_confirmed:
+                        format_confirmed = True
+                        chunk_is_openai = "choices" in chunk
+                        if chunk_is_openai != is_openai:
+                            is_openai = chunk_is_openai
+                            converter = XMLToJSONConverter(is_openai_format=is_openai)
 
                     if is_openai:
                         last_message_id = chunk.get("id") or last_message_id
@@ -876,15 +1141,14 @@ async def _stream_generator(
                         for tc in tool_chunks:
                             yield f"data: {json.dumps(tc)}\n\n".encode()
                     else:
-                        # Pass through non-text chunks (e.g., session metadata, usage)
-                        # But skip tool call index remapping for OpenAI tool_calls in delta
+                        # Pass through non-text chunks (thinking blocks, tool deltas, usage)
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
 
                 except json.JSONDecodeError:
                     # Malformed JSON — pass through raw line
                     yield f"{line}\n\n".encode()
             else:
-                # Non-data: lines (e.g. HTTP/metadata) — pass through
+                # Non-data lines (e.g. HTTP/metadata) — pass through
                 yield f"{line}\n".encode()
 
     finally:
@@ -892,7 +1156,12 @@ async def _stream_generator(
 
 
 def _extract_text_from_chunk(chunk: dict, is_openai: bool) -> str:
-    """Extracts text content from a streaming chunk delta."""
+    """Extracts text content from a streaming chunk delta.
+
+    Only returns text for types that need XML-conversion processing.
+    thinking_delta and input_json_delta pass through the stream verbatim
+    without entering the XMLToJSONConverter — their content must not be modified.
+    """
     if is_openai:
         choices = chunk.get("choices", [])
         if choices and isinstance(choices[0], dict):
@@ -901,7 +1170,10 @@ def _extract_text_from_chunk(chunk: dict, is_openai: bool) -> str:
     else:
         if chunk.get("type") == "content_block_delta":
             delta = chunk.get("delta", {})
-            if delta.get("type") == "text_delta":
+            delta_type = delta.get("type", "")
+            # Only text_delta enters the XML converter.
+            # thinking_delta and input_json_delta must not be touched.
+            if delta_type == "text_delta":
                 return delta.get("text") or ""
     return ""
 
@@ -945,7 +1217,15 @@ def _yield_text_delta(
 # ---------------------------------------------------------------------------
 
 def sanitize_json(obj: Any) -> Any:
-    """Recursively converts numeric 'id' fields to strings (Quatarly compatibility)."""
+    """Recursively converts numeric 'id' and '_id' fields to strings.
+
+    IMPORTANT: This is a workaround for a Quatarly API bug where numeric IDs
+    cause client parsing failures. This should be removed once Quatarly fixes
+    their response format. See: https://github.com/quatarly/api/issues/XXX
+
+    DO NOT use this for general-purpose JSON processing — it's a targeted fix
+    for a specific upstream bug.
+    """
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     if isinstance(obj, list):
@@ -953,7 +1233,8 @@ def sanitize_json(obj: Any) -> Any:
     if isinstance(obj, dict):
         result = {}
         for k, v in obj.items():
-            if k == "id" and isinstance(v, (int, float)):
+            # Convert numeric id/_id fields to strings (Quatarly bug)
+            if k in ("id", "_id") and isinstance(v, (int, float)):
                 result[k] = str(v)
             else:
                 result[k] = sanitize_json(v)

@@ -115,10 +115,11 @@ def init_db() -> None:
     try:
         cursor = conn.cursor()
 
-        # Enable WAL mode once. This pragma is idempotent — it's a no-op after
-        # the first run, but we run it every startup for safety in case the DB
-        # was copied from a non-WAL instance.
-        cursor.execute("PRAGMA journal_mode=WAL;")
+        # Enable WAL mode only if not already in WAL mode (avoid log spam)
+        cursor.execute("PRAGMA journal_mode;")
+        current_mode = cursor.fetchone()
+        if current_mode and current_mode[0].upper() != "WAL":
+            cursor.execute("PRAGMA journal_mode=WAL;")
 
         # ---- api_keys table ----
         cursor.execute("""
@@ -154,10 +155,11 @@ def init_db() -> None:
             if "duplicate column name" not in str(e).lower():
                 raise
 
-        # ---- Migrate rate_limit_daily / quota_limit if missing ----
+        # ---- Migrate rate_limit_daily / quota_limit / rate_limit_rpm if missing ----
         for col, default in [
             ("rate_limit_daily", 0),
             ("quota_limit", 0),
+            ("rate_limit_rpm", 0),   # 0 = unlimited (per-key requests per minute)
         ]:
             try:
                 cursor.execute(
@@ -237,38 +239,6 @@ def mask_key(key: str | None) -> str:
     if len(key) > 10:
         return f"{key[:4]}...{key[-4:]}"
     return "***masked***"
-
-
-def get_all_keys(
-    mask_quarterly_key: bool = True,
-) -> list[dict[str, Any]]:
-    """Retrieves all API keys.
-
-    Args:
-        mask_quarterly_key: If True, quarterly_key is masked.
-                            Use False only for internal admin operations.
-    """
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-            "created_at, last_used_at, rate_limit_daily, quota_limit "
-            "FROM api_keys ORDER BY created_at DESC"
-        )
-        rows = cursor.fetchall()
-        keys = []
-        for row in rows:
-            k = dict(row)
-            if mask_quarterly_key and k.get("quarterly_key"):
-                k["quarterly_key"] = mask_key(k["quarterly_key"])
-            keys.append(k)
-        return keys
-    except Exception as e:
-        logger.error("Error fetching all API keys: %s", e)
-        return []
-    finally:
-        conn.close()
 
 
 def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
@@ -572,3 +542,43 @@ def sweep_stale_cache_entries() -> int:
     if removed:
         logger.debug("Swept %d stale entries from key cache.", removed)
     return removed
+
+
+def get_all_keys(
+    mask_quarterly_key: bool = True,
+) -> list[dict[str, Any]]:
+    """Retrieves all API keys.
+
+    Args:
+        mask_quarterly_key: If True, quarterly_key is masked.
+                            Use False only for internal admin operations.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # Only fetch quarterly_key if we need it (mask=False for internal use)
+        if mask_quarterly_key:
+            cursor.execute(
+                "SELECT id, label, proxy_key, request_count, status, "
+                "created_at, last_used_at, rate_limit_daily, quota_limit "
+                "FROM api_keys ORDER BY created_at DESC"
+            )
+        else:
+            cursor.execute(
+                "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
+                "created_at, last_used_at, rate_limit_daily, quota_limit "
+                "FROM api_keys ORDER BY created_at DESC"
+            )
+        rows = cursor.fetchall()
+        keys = []
+        for row in rows:
+            k = dict(row)
+            if mask_quarterly_key and k.get("quarterly_key"):
+                k["quarterly_key"] = mask_key(k["quarterly_key"])
+            keys.append(k)
+        return keys
+    except Exception as e:
+        logger.error("Error fetching all API keys: %s", e)
+        return []
+    finally:
+        conn.close()

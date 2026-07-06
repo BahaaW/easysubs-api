@@ -103,20 +103,28 @@ FLUSHER_INTERVAL_SECONDS: float = float(os.environ.get("FLUSHER_INTERVAL_SECONDS
 # This enables compatibility across VS Code, Claude Code, Cursor, etc.
 # Values of None mean "pass through unchanged".
 _MODEL_ALIASES: dict[str, str | None] = {
-    # Anthropic-style aliases
+    # Anthropic-style "latest" aliases
     "claude-3-5-sonnet-latest": "claude-sonnet-4-6",
     "claude-3-5-sonnet-20241022": "claude-sonnet-4-6",
     "claude-3-opus-latest": "claude-opus-4-6",
     "claude-3-haiku-latest": "claude-haiku-4-5-20251001",
     "claude-3.5-sonnet-latest": "claude-sonnet-4-6",
     "claude-3.5-haiku-latest": "claude-haiku-4-5-20251001",
-    # OpenAI-compatible aliases some clients use
-    "gpt-4o": None,  # passthrough — Quatarly may or may not support
+    # Claude Code commonly sends these versioned names
+    "claude-opus-4-5": "claude-opus-4-6",
+    "claude-sonnet-4-5": "claude-sonnet-4-6",
+    "claude-3-opus-20240229": "claude-opus-4-6",
+    "claude-3-haiku-20240307": "claude-haiku-4-5-20251001",
+    "claude-3-sonnet-20240229": "claude-sonnet-4-6",
+    # OpenAI-compatible aliases (pass through — Quatarly handles or ignores)
+    "gpt-4o": None,
     "gpt-4o-mini": None,
+    "gpt-4-turbo": None,
+    "gpt-4": None,
     # Gemini
     "gemini-3.1-pro-latest": "gemini-3.1-pro",
     "gemini-3.1-pro-low-latest": "gemini-3.1-pro-low",
-    # Thinking variants (Quatarly-specific)
+    # Thinking variants (Quatarly-specific) — pass through unchanged
     "claude-sonnet-4-6-thinking": "claude-sonnet-4-6-thinking",
     "claude-opus-4-7-thinking": "claude-opus-4-7-thinking",
     "claude-opus-4-8-thinking": "claude-opus-4-8-thinking",
@@ -210,8 +218,15 @@ DEBUG_LOG_MAX_ENTRIES: int = int(os.environ.get("DEBUG_LOG_MAX_ENTRIES", 100))
 
 
 # ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+SHUTDOWN_TIMEOUT_SECONDS: float = float(os.environ.get("SHUTDOWN_TIMEOUT_SECONDS", 30.0))
+
+
+# ---------------------------------------------------------------------------
 # Per-key daily quota defaults
 # ---------------------------------------------------------------------------
 DEFAULT_DAILY_QUOTA: int = int(os.environ.get("DEFAULT_DAILY_QUOTA", 0))  # 0 = unlimited
+DEFAULT_KEY_RPM_LIMIT: int = int(os.environ.get("DEFAULT_KEY_RPM_LIMIT", 0))  # 0 = unlimited
 
 
