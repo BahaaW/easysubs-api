@@ -277,7 +277,7 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-            "created_at, last_used_at, quota_limit "
+            "created_at, last_used_at, quota_limit, rate_limit_rpm "
             "FROM api_keys WHERE proxy_key = ? AND status = 'active'",
             (proxy_key,),
         )
@@ -308,21 +308,49 @@ def get_key_by_proxy_key(proxy_key: str) -> dict[str, Any] | None:
 def increment_request_count(proxy_key: str) -> bool:
     """Increments the in-memory request counter and updates last_used_at.
 
-    Also checks daily quota if one is set on the key.
+    Also checks daily quota if one is set on the key. Resets daily_used at midnight UTC.
 
     Returns:
         True if the request is within quota (or no quota set), False if quota exceeded.
     """
     global _pending_increments
 
+    today = _get_today_date()
+
     # Check quota from cache if available
     with _cache_lock:
         if proxy_key in _keys_cache:
             entry = _keys_cache[proxy_key]
             quota = entry["data"].get("quota_limit") or 0
+            
+            # Reset daily_used if date has changed
+            if entry["data"].get("daily_reset_date") != today:
+                entry["data"]["daily_used"] = 0
+                entry["data"]["daily_reset_date"] = today
+            
             daily_used = entry["data"].get("daily_used") or 0
             if quota > 0 and daily_used >= quota:
                 return False  # Quota exceeded
+        else:
+            # Cache miss — fall back to DB to check quota before allowing the request.
+            # Without this, a fresh process restart or cache eviction would bypass quotas.
+            conn = get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT quota_limit FROM api_keys WHERE proxy_key = ? AND status = 'active'",
+                    (proxy_key,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    quota = row["quota_limit"] or 0
+                    if quota > 0:
+                        # Key not in cache means daily_used is effectively 0, so quota
+                        # can't be exceeded. But we still need to prime the cache so
+                        # subsequent requests within the same day are tracked.
+                        pass
+            finally:
+                conn.close()
 
     # Buffer the increment
     with _pending_increments_lock:

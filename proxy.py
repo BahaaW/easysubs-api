@@ -109,9 +109,6 @@ _ip_login_failures: dict[str, list[float]] = {}
 # Structure: { ip: { "count": int, "locked_until": float | None } }
 _ip_brute_force: dict[str, dict[str, Any]] = {}
 
-# Per-key daily quota tracking: proxy_key -> daily_used_count
-_key_daily_usage: dict[str, int] = {}
-
 # Per-key sliding-window rate limit tracking: proxy_key -> request timestamps
 _key_request_history: dict[str, list[float]] = {}
 
@@ -126,8 +123,6 @@ _MODELS_CACHE_TTL: float = 300.0  # 5 minutes
 
 # In-memory ring buffer of last-N debug log lines for troubleshooting
 _debug_stream_logs: list[str] = []
-_request_counter = 0
-_counter_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +143,6 @@ _http_client = httpx.AsyncClient(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _get_today_key() -> str:
-    """Returns 'YYYY-MM-DD' in UTC."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
 
 def get_client_ip(request: Request) -> str:
     """Extracts the real client IP, handling X-Forwarded-For from reverse proxies."""
@@ -532,15 +522,6 @@ async def admin_logout(request: Request) -> JSONResponse:
     return resp
 
 
-def _require_auth(request: Request) -> None:
-    """Raises 401 if the request has no valid admin session."""
-    # We use a sync check here since we're already in an async context
-    # that isn't using asyncio.to_thread — run the validation in a thread pool worker
-    loop = asyncio.get_running_loop()
-    # Can't await in a def function easily — use sync approach
-    pass
-
-
 @app.get("/api/admin/keys")
 async def get_keys(request: Request) -> JSONResponse:
     """Returns all API keys (quarterly_key masked) for the admin dashboard."""
@@ -703,6 +684,21 @@ async def list_models(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Path normalization
+# ---------------------------------------------------------------------------
+# Bare paths that some clients (older SDKs, custom wrappers) hit without
+# the /v1/ prefix. Defined at module level so it isn't re-allocated per request.
+_BARE_PATHS: set[str] = {
+    "chat/completions",
+    "completions",
+    "embeddings",
+    "models",
+    "messages",  # Anthropic /v1/messages
+    "count_tokens",  # Anthropic /v1/messages/count_tokens
+}
+
+
+# ---------------------------------------------------------------------------
 # Catch-all proxy route
 # ---------------------------------------------------------------------------
 
@@ -712,7 +708,7 @@ async def list_models(request: Request) -> JSONResponse:
 )
 async def proxy_request(request: Request, path: str) -> Response:
     """Main proxy: authenticates the proxy key, translates to Quarterly key, forwards."""
-    global _debug_stream_logs, _request_counter
+    global _debug_stream_logs
 
     client_ip = get_client_ip(request)
     request_id = request.headers.get("x-request-id") or _build_request_id()
@@ -743,7 +739,6 @@ async def proxy_request(request: Request, path: str) -> Response:
         )
 
     # ---- Normalize path (handle missing /v1/ prefix for some clients) ----
-    _BARE_PATHS = {"chat/completions", "completions", "embeddings", "models"}
     if not path.startswith("v1/") and path in _BARE_PATHS:
         path = f"v1/{path}"
 
@@ -860,6 +855,9 @@ def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
                 if isinstance(tc, dict):
                     t_name = tc.get("function", {}).get("name", "unknown")
                     t_args = tc.get("function", {}).get("arguments", "{}")
+                    # Some SDKs pre-parse arguments as a dict instead of a JSON string
+                    if isinstance(t_args, dict):
+                        t_args = json.dumps(t_args)
                     descriptions.append(f"[Assistant called tool '{t_name}' with args: {t_args}]")
             
             reminder_text = "\n\n".join(descriptions)
@@ -898,6 +896,7 @@ def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
                 elif b_type == "tool_result":
                     tool_id = block.get("tool_use_id", "")
                     tool_name = tool_id_to_name.get(tool_id, "unknown")
+                    is_error = block.get("is_error", False)
                     
                     raw_content = block.get("content")
                     text_content = ""
@@ -910,9 +909,10 @@ def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
                                 parts.append(sub_b.get("text", ""))
                         text_content = "\n".join(parts)
                     
+                    prefix = "[System: Tool error for" if is_error else "[System: Tool output for"
                     new_content.append({
                         "type": "text",
-                        "text": f"[System: Tool output for '{tool_name}']: {text_content}"
+                        "text": f"{prefix} '{tool_name}']: {text_content}"
                     })
                 else:
                     new_content.append(block)
@@ -932,7 +932,7 @@ def inject_system_reminder(data: dict, is_anthropic: bool = False) -> dict:
     )
 
     # 1. Anthropic format (system is a top-level parameter)
-    if is_anthropic or "system" in data:
+    if is_anthropic:
         system = data.get("system")
         if system is None:
             data["system"] = reminder
@@ -966,19 +966,30 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
 
-    # Bedrock Converse API does not support forced tool choice (any/required/tool/function) with thinking.
-    # If thinking is enabled, rewrite forced tool choices to "auto".
+    # Bedrock Converse API does not support *generic* forced tool choice
+    # (any/required/function — i.e. "call some tool") with thinking models.
+    # However, a SPECIFIC tool force (Anthropic type:"tool" with a name, or
+    # OpenAI type:"function" with a function.name) MUST be preserved — that's
+    # how clients like Claude Code force the model to use the edit tool instead
+    # of dumping file contents into chat. Downgrading it causes the model to
+    # respond in prose rather than calling the tool.
     if is_thinking and "tool_choice" in data:
         tc = data["tool_choice"]
         if isinstance(tc, dict):
-            # Anthropic: type is "any" or "tool". OpenAI: type is "function".
-            if tc.get("type") in ("any", "tool", "function"):
-                if tc.get("type") == "function":
-                    data["tool_choice"] = "auto"
-                else:
-                    data["tool_choice"] = {"type": "auto"}
+            tc_type = tc.get("type")
+            # Anthropic "any" → auto (generic force, breaks Bedrock)
+            if tc_type == "any":
+                data["tool_choice"] = {"type": "auto"}
+            # Anthropic "tool" with a specific name → KEEP (Claude Code edit flow)
+            # OpenAI "function" with a specific function.name → KEEP
+            # Only downgrade bare "function" without a name (shouldn't happen, but safe)
+            elif tc_type == "function" and not (
+                isinstance(tc.get("function"), dict) and tc["function"].get("name")
+            ):
+                data["tool_choice"] = "auto"
+            # type == "tool" with name, or "function" with name → pass through unchanged
         else:
-            # OpenAI format / string: "required" or "any"
+            # OpenAI string format: "required" or "any" → auto
             if tc in ("required", "any"):
                 data["tool_choice"] = "auto"
 
@@ -1198,8 +1209,11 @@ async def _stream_generator(
                     # Malformed JSON — pass through raw line
                     yield f"{line}\n\n".encode()
             else:
-                # Non-data lines (e.g. HTTP/metadata) — pass through
+                # Non-data lines (e.g. HTTP metadata, comments, empty lines)
+                # SSE spec requires \n\n as message boundary for empty lines
                 yield f"{line}\n".encode()
+                if not line.strip():
+                    yield b"\n"
 
     finally:
         await upstream.aclose()

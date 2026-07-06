@@ -223,10 +223,3 @@ DEBUG_LOG_MAX_ENTRIES: int = int(os.environ.get("DEBUG_LOG_MAX_ENTRIES", 100))
 SHUTDOWN_TIMEOUT_SECONDS: float = float(os.environ.get("SHUTDOWN_TIMEOUT_SECONDS", 30.0))
 
 
-# ---------------------------------------------------------------------------
-# Per-key daily quota defaults
-# ---------------------------------------------------------------------------
-DEFAULT_DAILY_QUOTA: int = int(os.environ.get("DEFAULT_DAILY_QUOTA", 0))  # 0 = unlimited
-DEFAULT_KEY_RPM_LIMIT: int = int(os.environ.get("DEFAULT_KEY_RPM_LIMIT", 0))  # 0 = unlimited
-
-
