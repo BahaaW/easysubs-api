@@ -456,7 +456,6 @@ async def readiness_check(request: Request) -> JSONResponse:
 async def admin_login(
     payload: LoginRequest,
     request: Request,
-    response: Response,
 ) -> JSONResponse:
     client_ip = get_client_ip(request)
 
@@ -496,7 +495,8 @@ async def admin_login(
 
         session_id = await asyncio.to_thread(db.create_session)
         is_secure = request.headers.get("x-forwarded-proto", "http") == "https"
-        response.set_cookie(
+        resp = JSONResponse({"success": True, "message": "Authenticated successfully"})
+        resp.set_cookie(
             key="admin_session",
             value=session_id,
             httponly=True,
@@ -504,7 +504,7 @@ async def admin_login(
             secure=is_secure,
             max_age=config.SESSION_COOKIE_MAX_AGE_SECONDS,
         )
-        return JSONResponse({"success": True, "message": "Authenticated successfully"})
+        return resp
     else:
         # Track the failed attempt with exponential backoff
         _ip_login_failures.setdefault(client_ip, []).append(time.time())
@@ -523,12 +523,13 @@ async def admin_login(
 
 
 @app.post("/api/admin/logout")
-async def admin_logout(request: Request, response: Response) -> JSONResponse:
+async def admin_logout(request: Request) -> JSONResponse:
     session_id = request.cookies.get("admin_session")
     if session_id:
         await asyncio.to_thread(db.delete_session, session_id)
-    response.delete_cookie("admin_session")
-    return JSONResponse({"success": True, "message": "Logged out successfully"})
+    resp = JSONResponse({"success": True, "message": "Logged out successfully"})
+    resp.delete_cookie("admin_session")
+    return resp
 
 
 def _require_auth(request: Request) -> None:
