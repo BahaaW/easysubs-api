@@ -155,6 +155,15 @@ def init_db() -> None:
             if "duplicate column name" not in str(e).lower():
                 raise
 
+        # ---- Migrate expires_at if missing from sessions ----
+        try:
+            cursor.execute(
+                "ALTER TABLE sessions ADD COLUMN expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
         # ---- Migrate rate_limit_daily / quota_limit / rate_limit_rpm if missing ----
         for col, default in [
             ("rate_limit_daily", 0),
