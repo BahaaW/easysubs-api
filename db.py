@@ -565,25 +565,17 @@ def get_all_keys(
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # Only fetch quarterly_key if we need it (mask=False for internal use)
-        if mask_quarterly_key:
-            cursor.execute(
-                "SELECT id, label, proxy_key, request_count, status, "
-                "created_at, last_used_at, rate_limit_daily, quota_limit "
-                "FROM api_keys ORDER BY created_at DESC"
-            )
-        else:
-            cursor.execute(
-                "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
-                "created_at, last_used_at, rate_limit_daily, quota_limit "
-                "FROM api_keys ORDER BY created_at DESC"
-            )
+        cursor.execute(
+            "SELECT id, label, proxy_key, quarterly_key, request_count, status, "
+            "created_at, last_used_at, rate_limit_daily, quota_limit, rate_limit_rpm "
+            "FROM api_keys ORDER BY created_at DESC"
+        )
         rows = cursor.fetchall()
         keys = []
         for row in rows:
             k = dict(row)
-            if mask_quarterly_key and k.get("quarterly_key"):
-                k["quarterly_key"] = mask_key(k["quarterly_key"])
+            if mask_quarterly_key:
+                k["quarterly_key"] = mask_key(k.get("quarterly_key"))
             keys.append(k)
         return keys
     except Exception as e:
