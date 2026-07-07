@@ -871,6 +871,10 @@ async def proxy_request(request: Request, path: str) -> Response:
                 )
         except Exception as e:
             logger.warning("Failed to process request body: %s", e)
+            # If body parsing fails, assume streaming is needed — the
+            # upstream will likely return text/event-stream regardless,
+            # and forcing stream=False causes a conn state mismatch.
+            client_wants_stream = True
 
     # ---- Handle streaming vs non-streaming upstream ----
     upstream_method = request.method
@@ -894,7 +898,7 @@ async def proxy_request(request: Request, path: str) -> Response:
 
     except Exception as e:
         logger.exception("request_id=%s proxy error: %s", request_id, e)
-        raise HTTPException(status_code=502, detail=f"Proxy error: {e}")
+        raise HTTPException(status_code=502, detail=f"Proxy error: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1065,43 +1069,34 @@ def clean_tool_history_if_needed(data: dict) -> dict:
     model = data.get("model", "")
     is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
-
-    # Fast-path: when tools are present, tool blocks are valid and should stay
-    # structured. The only cleanup needed is tool_choice for thinking models.
     messages = data.get("messages")
-    if has_tools:
-        # Still downgrade generic forced tool choices for thinking models
-        if is_thinking and "tool_choice" in data:
-            tc = data["tool_choice"]
-            if isinstance(tc, dict):
-                tc_type = tc.get("type")
-                if tc_type == "any":
-                    data["tool_choice"] = {"type": "auto"}
-                elif tc_type == "function" and not (
-                    isinstance(tc.get("function"), dict) and tc["function"].get("name")
-                ):
-                    data["tool_choice"] = "auto"
-            else:
-                if tc in ("required", "any"):
-                    data["tool_choice"] = "auto"
+
+    # Bedrock returns 400 when message history contains toolUse/toolResult
+    # blocks but no tools array is defined (or when tools aren't compatible
+    # with the model). Convert history blocks to text while keeping the tools
+    # array intact so the model can still make tool calls going forward.
+    if is_thinking and has_tools:
+        if isinstance(messages, list):
+            data["messages"] = _convert_tool_blocks_to_text(messages)
         return data
 
-    # Detect whether the message history contains any tool blocks (tool_use,
-    # tool_result, or tool_calls). Bedrock requires toolConfig when these are
-    # present, even if the current request has no tools array.
+    # Fast-path: tools present on non-thinking model — pass through unchanged.
+    if has_tools:
+        return data
+
+    # No tools in request, but check if history has tool blocks
+    # (Bedrock 400 if toolConfig is missing but blocks exist).
     _has_tool_blocks_in_history = False
     if isinstance(messages, list):
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
-            # OpenAI: tool_calls in assistant message or role=tool
             if msg.get("role") == "tool":
                 _has_tool_blocks_in_history = True
                 break
             if "tool_calls" in msg and msg["tool_calls"]:
                 _has_tool_blocks_in_history = True
                 break
-            # Anthropic: tool_use or tool_result in content list
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -1305,14 +1300,33 @@ async def _stream_generator(
                 try:
                     chunk = json.loads(data_str)
 
-                    # Fast-path: if we've already determined no XML processing is
-                    # needed, skip sanitize+map+convert and just re-serialize.
-                    if _needs_xml_processing is False:
+                    # Check if this chunk contains tool calls — these need
+                    # sanitize (numeric ID fix) and index mapping regardless
+                    # of the XML fast-path. Covers OpenAI tool_calls and
+                    # Anthropic content_block_{start,delta} with tool_use/input_json_delta.
+                    _has_tool_calls = False
+                    if "choices" in chunk:
+                        for c in chunk["choices"]:
+                            if isinstance(c, dict) and "delta" in c and "tool_calls" in c["delta"] and c["delta"]["tool_calls"]:
+                                _has_tool_calls = True
+                                break
+                    else:
+                        c_type = chunk.get("type", "")
+                        if c_type.startswith("content_block_") and "index" in chunk:
+                            _has_tool_calls = True
+                        elif c_type == "content_block_delta":
+                            delta = chunk.get("delta", {})
+                            if delta.get("type") in ("input_json_delta", "tool_use"):
+                                _has_tool_calls = True
+
+                    if _has_tool_calls:
+                        chunk = sanitize_json(chunk)
+                        chunk = map_chunk_tool_calls(chunk, mapper)
+
+                    # Fast-path: text-only chunk in a clean-text stream.
+                    if _needs_xml_processing is False and not _has_tool_calls:
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                         continue
-
-                    chunk = sanitize_json(chunk)
-                    chunk = map_chunk_tool_calls(chunk, mapper)
 
                     # Refine format on first real chunk
                     if not format_confirmed:

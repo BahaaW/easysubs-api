@@ -1,9 +1,13 @@
 # EasySubs API - Project Primer
-**Status**: Admin dashboard, translation proxy, HTTP/2 multiplexing, sliding cache, real-time streaming, thread offloads, batch flusher, XML-to-JSON parser, and multi-app compat layer complete.
+**Status**: Full security audit (007) completed, performance optimizations applied, dashboard metrics fixed.
 **Completed this session**:
-- Implemented tool block history translation to plain text (protecting against Bedrock 400 errors).
-- Added multi-app compatibility: wired model aliases, rate_limit_rpm limiter, models caching, and path normalization.
-- Solved double-close response bug, verified Cursor 400 error pass-through, and migrated database sessions table to add missing expires_at column.
-**Next steps**:
-- Run VS Code or Cursor client through the proxy and verify RPM limiting and format mapping on live runs.
+- 007 security audit: 3 critical, 2 medium, 1 low finding — all fixed.
+- Added CSRF protection, Fernet key encryption, CSP headers, `__Host-` cookie prefix.
+- Fixed dashboard not showing request_count/last_used_at (flush wasn't writing them).
+- Fixed double-counting bug in DB recovery (baseline + new increments).
+- Fixed daily_reset_date migration type (INTEGER → TEXT).
+- Added rate_limit_rpm column migration.
+- Performance: non-streaming reqs skip upstream SSE, stream generator fast-path for clean responses.
+- Updated wiki: Security Hardening, Performance Optimization, Fernet Encryption pages.
+**Next steps**: None.
 **Blockers**: None.
