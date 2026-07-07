@@ -266,14 +266,18 @@ def _generate_csrf_token() -> str:
 def _validate_csrf(session_id: str, token: str) -> bool:
     """Validates a CSRF token against the in-memory store. Cleans expired tokens."""
     now = time.time()
+    entry = _csrf_tokens.get(session_id)
+    if not entry:
+        return False
+    # Handle legacy float-only entries (pre-fix bug)
+    if isinstance(entry, (int, float)):
+        del _csrf_tokens[session_id]
+        return False
     # Purge expired tokens
-    expired = [k for k, v in _csrf_tokens.items() if now >= v]
-    for k in expired:
-        del _csrf_tokens[k]
-    expected = _csrf_tokens.get(session_id)
-    if expected and secrets.compare_digest(expected, token):
-        return True
-    return False
+    if now >= entry["expires_at"]:
+        del _csrf_tokens[session_id]
+        return False
+    return secrets.compare_digest(entry["token"], token)
 
 
 async def _require_csrf(request: Request) -> None:
@@ -507,7 +511,7 @@ async def get_csrf_token(request: Request) -> JSONResponse:
         raise HTTPException(status_code=401, detail="Unauthorized")
     session_id = request.cookies.get("__Host-admin_session")
     token = _generate_csrf_token()
-    _csrf_tokens[session_id] = time.time() + _CSRF_TOKEN_TTL
+    _csrf_tokens[session_id] = {"token": token, "expires_at": time.time() + _CSRF_TOKEN_TTL}
     return JSONResponse({"token": token})
 
 

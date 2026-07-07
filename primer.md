@@ -1,13 +1,10 @@
 # EasySubs API - Project Primer
-**Status**: Full security audit (007) completed, performance optimizations applied, dashboard metrics fixed.
+**Status**: Bedrock 400 fixed, editing bugs fixed, stream generator tool call detection fixed, 502 timeout handling improved.
 **Completed this session**:
-- 007 security audit: 3 critical, 2 medium, 1 low finding — all fixed.
-- Added CSRF protection, Fernet key encryption, CSP headers, `__Host-` cookie prefix.
-- Fixed dashboard not showing request_count/last_used_at (flush wasn't writing them).
-- Fixed double-counting bug in DB recovery (baseline + new increments).
-- Fixed daily_reset_date migration type (INTEGER → TEXT).
-- Added rate_limit_rpm column migration.
-- Performance: non-streaming reqs skip upstream SSE, stream generator fast-path for clean responses.
-- Updated wiki: Security Hardening, Performance Optimization, Fernet Encryption pages.
+- Fixed Bedrock 400: thinking models keep tools, only history converted to text.
+- Fixed "doesn't edit" bug: stream fast-path skipping sanitize/mapper on tool call chunks.
+- Fixed Anthropic input_json_delta tool call detection.
+- Fixed 502 after timeout: body parsing failure now defaults to streaming mode.
+- Wiki: added Bedrock 400, editing bugs, and stream fix log entries.
 **Next steps**: None.
 **Blockers**: None.
