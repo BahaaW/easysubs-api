@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -901,8 +902,13 @@ async def proxy_request(request: Request, path: str) -> Response:
         return upstream_resp
 
     except Exception as e:
-        logger.exception("request_id=%s proxy error: %s", request_id, e)
-        raise HTTPException(status_code=502, detail=f"Proxy error: {type(e).__name__}: {e}")
+        logger.exception("request_id=%s proxy error", request_id)
+        tb = traceback.format_exc()
+        tb_last_line = tb.strip().split("\n")[-1] if tb else str(e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Proxy error: {type(e).__name__}: {tb_last_line}",
+        )
 
 
 # ---------------------------------------------------------------------------
