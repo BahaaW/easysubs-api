@@ -1172,8 +1172,10 @@ async def _forward_request(
     upstream = await _http_client.send(req, stream=stream)
     content_type = upstream.headers.get("content-type", "")
 
-    # Check if this is a streaming response
-    if "text/event-stream" in content_type or "stream" in content_type.lower():
+    # Check if this is a streaming response.
+    # Trust the client's stream preference first — some upstreams (Quatarly)
+    # return SSE with text/plain instead of text/event-stream content-type.
+    if stream or "text/event-stream" in content_type or "stream" in content_type.lower():
         return StreamingResponse(
             _stream_generator(upstream, request_id, is_anthropic_client=is_anthropic_client),
             status_code=upstream.status_code,
