@@ -1075,22 +1075,20 @@ def inject_system_reminder(data: dict, is_anthropic: bool = False) -> dict:
 
 
 def clean_tool_history_if_needed(data: dict) -> dict:
-    """Cleans request payloads for thinking models and toolless requests to prevent Bedrock 400 errors."""
+    """Cleans request payloads to prevent Bedrock 400 errors.
+
+    Bedrock requires toolConfig when the message history contains
+    toolUse/toolResult blocks. If the current request has no tools array
+    but the history does, the blocks are converted to plain text.
+
+    If tools ARE present (or no tool blocks in history), passes through
+    unchanged — works for all models including thinking variants.
+    """
     model = data.get("model", "")
-    is_thinking = "thinking" in model.lower()
     has_tools = "tools" in data and bool(data["tools"])
     messages = data.get("messages")
 
-    # Bedrock returns 400 when message history contains toolUse/toolResult
-    # blocks but no tools array is defined (or when tools aren't compatible
-    # with the model). Convert history blocks to text while keeping the tools
-    # array intact so the model can still make tool calls going forward.
-    if is_thinking and has_tools:
-        if isinstance(messages, list):
-            data["messages"] = _convert_tool_blocks_to_text(messages)
-        return data
-
-    # Fast-path: tools present on non-thinking model — pass through unchanged.
+    # Fast-path: tools present — pass through unchanged.
     if has_tools:
         return data
 
