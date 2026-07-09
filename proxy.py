@@ -861,7 +861,6 @@ async def proxy_request(request: Request, path: str) -> Response:
                             "request_id=%s model alias: %s → %s",
                             request_id, original_model, resolved,
                         )
-                data = inject_system_reminder(data, is_anthropic=is_anthropic_client)
                 data = clean_tool_history_if_needed(data)
                 client_wants_stream = data.get("stream", False)
                 body = json.dumps(data).encode("utf-8")
@@ -1038,41 +1037,6 @@ def _convert_tool_blocks_to_text(messages: list[dict]) -> list[dict]:
     return converted
 
 
-def inject_system_reminder(data: dict, is_anthropic: bool = False) -> dict:
-    """Injects a system reminder about using available tools instead of raw markdown text."""
-    reminder = (
-        "(System Reminder: You MUST use your available tools to create, write, edit files or run commands. "
-        "Do not write full file contents or diffs in markdown blocks in your chat response. Use the tools.)"
-    )
-
-    # 1. Anthropic format (system is a top-level parameter)
-    if is_anthropic:
-        system = data.get("system")
-        if system is None:
-            data["system"] = reminder
-        elif isinstance(system, str):
-            data["system"] = system + "\n\n" + reminder
-        elif isinstance(system, list):
-            system.append({"type": "text", "text": reminder})
-            data["system"] = system
-            
-    # 2. OpenAI format (system is a role inside messages list)
-    else:
-        messages = data.get("messages")
-        if isinstance(messages, list) and messages:
-            first_msg = messages[0]
-            if isinstance(first_msg, dict) and first_msg.get("role") == "system":
-                content = first_msg.get("content") or ""
-                if isinstance(content, str):
-                    first_msg["content"] = content + "\n\n" + reminder
-                elif isinstance(content, list):
-                    content.append({"type": "text", "text": reminder})
-                    first_msg["content"] = content
-            else:
-                messages.insert(0, {"role": "system", "content": reminder})
-
-    return data
-
 
 def clean_tool_history_if_needed(data: dict) -> dict:
     """Cleans request payloads to prevent Bedrock 400 errors.
@@ -1119,6 +1083,15 @@ def clean_tool_history_if_needed(data: dict) -> dict:
             data["messages"] = _convert_tool_blocks_to_text(messages)
 
     return data
+
+
+def _is_valid_json(s: str) -> bool:
+    """Returns True if s is valid JSON. Used for SSE line reassembly."""
+    try:
+        json.loads(s)
+        return True
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
 
 
 def _extract_proxy_key(request: Request) -> str | None:
@@ -1272,7 +1245,52 @@ async def _stream_generator(
     _needs_xml_processing: bool | None = None  # tri-state: None=unknown, True/False
 
     try:
-        async for line in upstream.aiter_lines():
+        _sse_line_buf: str | None = None
+        _MAX_SSE_BUF = 262144  # 256KB safety limit
+
+        async for raw_line in upstream.aiter_lines():
+            # ---- SSE malformed-line reassembly ----
+            # Some upstreams send raw newlines inside JSON (improper SSE).
+            # Stitch continuation lines back onto the previous data: line.
+            if _sse_line_buf is not None:
+                if raw_line.startswith("data:"):
+                    # New data line while buffering — previous was truncated
+                    yield f"{_sse_line_buf}\n\n".encode()
+                    _sse_line_buf = None
+                    line = raw_line
+                elif raw_line.startswith(":"):
+                    # SSE comment while buffering
+                    yield f"{_sse_line_buf}\n\n".encode()
+                    _sse_line_buf = None
+                    yield f"{raw_line}\n".encode()
+                    continue
+                elif not raw_line:
+                    yield f"{_sse_line_buf}\n\n".encode()
+                    _sse_line_buf = None
+                    continue
+                else:
+                    _sse_line_buf += raw_line
+                    if len(_sse_line_buf) > _MAX_SSE_BUF:
+                        yield f"{_sse_line_buf}\n\n".encode()
+                        _sse_line_buf = None
+                        continue
+                    test = _sse_line_buf
+                    if test.startswith("data:"):
+                        test = test[5:].strip()
+                    else:
+                        test = test.strip()
+                    if test == "[DONE]" or _is_valid_json(test):
+                        line = _sse_line_buf
+                        _sse_line_buf = None
+                    else:
+                        continue
+            elif not raw_line.startswith("data:") and not raw_line.startswith(":") and raw_line.strip():
+                # Orphan non-data line — could be JSON continuation
+                _sse_line_buf = raw_line
+                continue
+            else:
+                line = raw_line
+
             if not line:
                 continue
 
@@ -1370,13 +1388,21 @@ async def _stream_generator(
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
 
                 except json.JSONDecodeError:
-                    # Malformed JSON — pass through raw line
-                    yield f"{line}\n\n".encode()
+                    # Malformed JSON — could be a truncated SSE line.
+                    # Buffer it for reassembly. If buffer is already active,
+                    # force-flush and reset.
+                    if _sse_line_buf is not None:
+                        yield f"{_sse_line_buf}\n\n".encode()
+                    _sse_line_buf = line
             else:
                 # Non-data lines (e.g. HTTP metadata, comments, empty lines)
                 yield f"{line}\n".encode()
                 if not line.strip():
                     yield b"\n"
+
+        # Flush any remaining buffered line (stream ended without [DONE])
+        if _sse_line_buf is not None:
+            yield f"{_sse_line_buf}\n\n".encode()
 
     finally:
         await upstream.aclose()
